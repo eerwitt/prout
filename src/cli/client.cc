@@ -19,6 +19,7 @@
 #include <fcntl.h>
 #include <io.h>
 #include <process.h>
+#include <windows.h>
 #else
 #include <sys/wait.h>
 #include <unistd.h>
@@ -129,53 +130,102 @@ private:
   bool redacted_ = false;
 };
 
+#if defined(_WIN32)
+std::string QuoteWindowsArg(const std::string &arg) {
+  if (arg.empty() || arg.find_first_of(" \t\n\v\"") != std::string::npos) {
+    std::string out = "\"";
+    int backslashes = 0;
+    for (char c : arg) {
+      if (c == '\\') {
+        ++backslashes;
+        continue;
+      }
+      if (c == '"') {
+        out.append(static_cast<std::size_t>(backslashes * 2 + 1), '\\');
+        out.push_back('"');
+      } else {
+        out.append(static_cast<std::size_t>(backslashes), '\\');
+        out.push_back(c);
+      }
+      backslashes = 0;
+    }
+    out.append(static_cast<std::size_t>(backslashes * 2), '\\');
+    out.push_back('"');
+    return out;
+  }
+  return arg;
+}
+
+std::string WindowsCommandLine(const std::vector<std::string> &command) {
+  std::string out;
+  for (const auto &arg : command) {
+    if (!out.empty())
+      out.push_back(' ');
+    out += QuoteWindowsArg(arg);
+  }
+  return out;
+}
+#endif
+
 int SpawnChildFiltered(const std::vector<std::string> &command,
                        const std::string &env_var, SecureBuffer &cred,
                        bool *redacted) {
   if (command.empty())
     return 127;
-  std::vector<char *> argv;
-  for (const auto &a : command)
-    argv.push_back(const_cast<char *>(a.c_str()));
-  argv.push_back(nullptr);
 
-  int pipefd[2];
 #if defined(_WIN32)
-  if (_pipe(pipefd, 4096, _O_BINARY) != 0)
+  HANDLE read_handle = nullptr;
+  HANDLE write_handle = nullptr;
+  SECURITY_ATTRIBUTES sa{};
+  sa.nLength = sizeof(sa);
+  sa.bInheritHandle = TRUE;
+  if (!CreatePipe(&read_handle, &write_handle, &sa, 0))
     return 127;
-  int saved_out = _dup(_fileno(stdout));
-  int saved_err = _dup(_fileno(stderr));
-  _dup2(pipefd[1], _fileno(stdout));
-  _dup2(pipefd[1], _fileno(stderr));
-  _close(pipefd[1]);
+  SetHandleInformation(read_handle, HANDLE_FLAG_INHERIT, 0);
+
+  STARTUPINFOA si{};
+  si.cb = sizeof(si);
+  si.dwFlags = STARTF_USESTDHANDLES;
+  si.hStdInput = GetStdHandle(STD_INPUT_HANDLE);
+  si.hStdOutput = write_handle;
+  si.hStdError = write_handle;
+  PROCESS_INFORMATION pi{};
+  std::string cmdline = WindowsCommandLine(command);
   SetEnv(env_var, cred.c_str());
-  intptr_t child = _spawnvp(_P_NOWAIT, argv[0], argv.data());
+  BOOL created =
+      CreateProcessA(nullptr, cmdline.data(), nullptr, nullptr, TRUE, 0,
+                     nullptr, nullptr, &si, &pi);
   UnsetEnv(env_var);
-  _dup2(saved_out, _fileno(stdout));
-  _dup2(saved_err, _fileno(stderr));
-  _close(saved_out);
-  _close(saved_err);
-  if (child == -1) {
-    _close(pipefd[0]);
-    std::fprintf(stderr, "prout: failed to run '%s'\n", argv[0]);
+  CloseHandle(write_handle);
+  if (!created) {
+    CloseHandle(read_handle);
+    std::fprintf(stderr, "prout: failed to run '%s'\n", command[0].c_str());
     return 127;
   }
   Redactor filter(std::string(cred.c_str(), cred.size()));
   std::thread reader([&] {
     char buf[4096];
-    int n = 0;
-    while ((n = _read(pipefd[0], buf, sizeof(buf))) > 0)
+    DWORD n = 0;
+    while (ReadFile(read_handle, buf, sizeof(buf), &n, nullptr) && n > 0)
       filter.Write(buf, static_cast<std::size_t>(n));
-    _close(pipefd[0]);
+    CloseHandle(read_handle);
   });
-  int status = 0;
-  _cwait(&status, child, 0);
+  WaitForSingleObject(pi.hProcess, INFINITE);
+  DWORD exit_code = 1;
+  GetExitCodeProcess(pi.hProcess, &exit_code);
+  CloseHandle(pi.hThread);
+  CloseHandle(pi.hProcess);
   reader.join();
   filter.Finish();
   if (redacted)
     *redacted = filter.redacted();
-  return status;
+  return static_cast<int>(exit_code);
 #else
+  std::vector<char *> argv;
+  for (const auto &a : command)
+    argv.push_back(const_cast<char *>(a.c_str()));
+  argv.push_back(nullptr);
+  int pipefd[2];
   if (pipe(pipefd) != 0)
     return 127;
   SetEnv(env_var, cred.c_str());

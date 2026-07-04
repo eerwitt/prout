@@ -13,7 +13,7 @@ The model recommends; code enforces. Unknown services, malformed arbiter output,
 
 ```powershell
 prout vault init
-prout vault add <service> --env <VAR> --disclosure inject|reveal --max-ttl <sec> --max-uses <n>
+prout vault add <service> --inject-env <VAR> --disclosure inject|reveal --max-ttl <sec> --max-uses <n>
 prout vault list
 
 prout serve [--model <path>] [--backend cpu|gpu] [--vault <dir>]
@@ -46,8 +46,15 @@ Use one terminal for the daemon:
 Use another terminal to negotiate a credential lease. The first `run` call for a run conversation must include the command after `--`. `run` stores that command with the conversation, but does not execute it; it returns safe JSON metadata and, when approved, a `lease_id` for execution.
 
 ```powershell
-.\dist\prout.exe run --service ml.huggingface --intent "checking the token is valid against the website" --agent local -- powershell -NoProfile -Command '$h=@{Authorization=("Bearer " + $env:HF_TOKEN)}; Invoke-RestMethod -Headers $h -Uri https://huggingface.co/api/whoami-v2'
+.\dist\prout.exe run --service ml.huggingface --intent "checking the token is valid against the website" --agent local -- powershell -NoProfile -Command "curl.exe -4 -H ('Authorization: Bearer ' + `$env:HF_TOKEN) 'https://huggingface.co/api/whoami-v2'"
 ```
+
+In PowerShell, escape child variables with a backtick, for example
+`` `$env:HF_TOKEN `` and `` `$h ``, so they are expanded only by the child
+process during `execute`, after Prout injects the credential. Keep the command
+on one line; do not split the child command across continuation prompts. The
+example uses `curl.exe -4` because some Windows networks reset Hugging Face TLS
+connections over IPv6.
 
 If the response has `"status":"question"`, answer with the returned conversation id. The original command remains stored with that conversation unless the request is denied or the conversation times out:
 
@@ -55,7 +62,7 @@ If the response has `"status":"question"`, answer with the returned conversation
 .\dist\prout.exe run --conversation <question-conversation-id> --details "Validate the Hugging Face token with the whoami API once, without changing account state." --agent local
 ```
 
-When the response has `"status":"granted"`, pass its `lease_id` to `execute`. For inject services, the grant response also includes `"env_var":"HF_TOKEN"` or the configured variable name, so callers can see which child-process environment variable will receive the credential. This example assumes the service was added with `--env HF_TOKEN`.
+When the response has `"status":"granted"`, pass its `lease_id` to `execute`. For inject services, the grant response also includes `"env_var":"HF_TOKEN"` or the configured variable name, so callers can see which child-process environment variable will receive the credential. This example assumes the service was added with `--inject-env HF_TOKEN`.
 
 ```powershell
 .\dist\prout.exe execute --lease <approved-lease-id>
