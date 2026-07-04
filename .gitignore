@@ -53,3 +53,21 @@ dkms.conf
 
 # debug information files
 *.dwo
+
+# Build outputs
+build/
+build*/
+dist/
+_deps/
+
+# Bazel outputs inside the vendored submodule
+bazel-*
+third_party/litert-lm/bazel-*
+
+# Models are large and license-gated; never commit them.
+*.litertlm
+
+# Editor / OS cruft
+.vscode/
+.DS_Store
+compile_commands.json
