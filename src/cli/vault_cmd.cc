@@ -169,7 +169,7 @@ std::string Advice(const Args &a, const std::string &action, const Service *s) {
   std::string intent = action + " vault service with " + MetadataSummary(*s) +
                        " details=" + s->details;
   std::string negotiation_id;
-  Verdict v = (*arbiter)->Begin(*s, "vault-cli", intent, &negotiation_id);
+  Verdict v = (*arbiter)->Begin(*s, "vault-cli", intent, "", &negotiation_id);
   if (v.type == Verdict::Type::kQuestion)
     return "model asked: " + v.question +
            "; local schema and safety checks accepted " + action;

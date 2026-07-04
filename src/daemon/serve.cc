@@ -5,7 +5,6 @@
 #include <array>
 #include <atomic>
 #include <chrono>
-#include <cctype>
 #include <csignal>
 #include <cstdio>
 #include <map>
@@ -34,17 +33,6 @@ namespace {
 
 std::atomic<bool> g_stop{false};
 void OnSignal(int) { g_stop.store(true); }
-
-std::string Lower(std::string s) {
-  std::transform(s.begin(), s.end(), s.begin(), [](unsigned char c) {
-    return static_cast<char>(std::tolower(c));
-  });
-  return s;
-}
-
-bool Has(const std::string &s, const std::string &needle) {
-  return s.find(needle) != std::string::npos;
-}
 
 std::string NewConversationId() {
   std::array<std::uint8_t, 32> bytes{};
@@ -229,72 +217,6 @@ private:
   bool Expired(const Conversation &c) const {
     return std::chrono::steady_clock::now() >= c.expires_at;
   }
-  bool CommandFits(const Conversation &c, const std::string &command) const {
-    std::string text = Lower(c.intent + " " + c.details);
-    std::string cmd = Lower(command);
-    bool read_only = Has(text, "read") || Has(text, "check") ||
-                     Has(text, "verify") || Has(text, "list") ||
-                     Has(text, "debug") || Has(text, "diagnostic");
-    bool mutating = Has(cmd, "set-content") || Has(cmd, "remove-item") ||
-                    Has(cmd, " rm ") || Has(cmd, " del ") ||
-                    Has(cmd, "delete") || Has(cmd, "write") ||
-                    Has(cmd, "update");
-    return !(read_only && mutating);
-  }
-
-  std::vector<std::string> CommandHosts(const std::string &command) const {
-    std::vector<std::string> hosts;
-    std::string lower = Lower(command);
-    std::size_t pos = 0;
-    while (true) {
-      std::size_t http = lower.find("http://", pos);
-      std::size_t https = lower.find("https://", pos);
-      std::size_t start =
-          std::min(http == std::string::npos ? lower.size() : http,
-                   https == std::string::npos ? lower.size() : https);
-      if (start == lower.size())
-        break;
-      start += lower.compare(start, 8, "https://") == 0 ? 8 : 7;
-      std::size_t end = lower.find_first_of(" /?#'\"`)", start);
-      std::string host =
-          lower.substr(start, end == std::string::npos ? end : end - start);
-      if (!host.empty() && host.front() == '[') {
-        auto close = host.find(']');
-        if (close != std::string::npos)
-          host = host.substr(1, close - 1);
-      } else {
-        auto colon = host.find(':');
-        if (colon != std::string::npos)
-          host.erase(colon);
-      }
-      while (!host.empty() && host.back() == '.')
-        host.pop_back();
-      if (!host.empty())
-        hosts.push_back(host);
-      if (end == std::string::npos)
-        break;
-      pos = end + 1;
-    }
-    return hosts;
-  }
-
-  bool CommandTargetsServiceHost(const Service &s,
-                                 const std::string &command) const {
-    if (s.website_host.empty())
-      return true;
-    auto hosts = CommandHosts(command);
-    if (hosts.empty())
-      return true;
-    std::string allowed = Lower(s.website_host);
-    for (const auto &host : hosts) {
-      if (host != allowed && !(host.size() > allowed.size() &&
-                               host.compare(host.size() - allowed.size(),
-                                            allowed.size(), allowed) == 0 &&
-                               host[host.size() - allowed.size() - 1] == '.'))
-        return false;
-    }
-    return true;
-  }
   std::string DeliverCredential(const Conversation &c, const Service &s) {
     std::string credential(reinterpret_cast<const char *>(s.credential.data()),
                            s.credential.size());
@@ -330,7 +252,8 @@ private:
       return Error("run requires a command after `--`");
 
     std::string arbiter_id;
-    Verdict v = arbiter_->Begin(*s, c.agent, c.intent, &arbiter_id);
+    Verdict v =
+        arbiter_->Begin(*s, c.agent, c.intent, c.command_summary, &arbiter_id);
     c.arbiter_id = arbiter_id;
     if (v.type == Verdict::Type::kQuestion)
       return Question(c, v.question);
@@ -393,16 +316,9 @@ private:
     if (!c.approved || c.kind != "run")
       return Deny(c, "lease is not approved for execute", "execute",
                   c.command_summary);
-    if (!CommandFits(c, c.command_summary))
-      return Deny(c, "command does not fit the approved conversation context",
-                  "execute", c.command_summary);
     const Service *s = vault_.Find(c.service);
     if (!s)
       return Error("service vanished from vault");
-    if (!CommandTargetsServiceHost(*s, c.command_summary))
-      return Deny(
-          c, "command targets a different website host than the service policy",
-          "execute", c.command_summary);
     std::uint32_t left = 0;
     std::string service;
     auto lease_status = leases_.Consume(lease_id, c.service, &left, &service);

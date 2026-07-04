@@ -124,6 +124,15 @@ if(WIN32)
   set(LITERT_TOPK_WEBGPU_SAMPLER_DLL
       "${LITERT_LM_ROOT}/prebuilt/windows_x86_64/libLiteRtTopKWebGpuSampler.dll"
       CACHE FILEPATH "Path to libLiteRtTopKWebGpuSampler.dll")
+  set(LITERT_TOPK_OPENCL_SAMPLER_DLL
+      "${LITERT_LM_ROOT}/prebuilt/windows_x86_64/libLiteRtTopKOpenClSampler.dll"
+      CACHE FILEPATH "Path to libLiteRtTopKOpenClSampler.dll")
+  set(LITERT_OPENCL_ACCELERATOR_DLL
+      "${LITERT_LM_ROOT}/prebuilt/windows_x86_64/libLiteRtOpenClAccelerator.dll"
+      CACHE FILEPATH "Path to libLiteRtOpenClAccelerator.dll")
+  set(LITERT_GPU_ACCELERATOR_DLL
+      "${LITERT_LM_ROOT}/prebuilt/windows_x86_64/libLiteRtGpuAccelerator.dll"
+      CACHE FILEPATH "Path to libLiteRtGpuAccelerator.dll")
   set(LITERT_WEBGPU_DAWN_DLL
       "${LITERT_LM_ROOT}/prebuilt/windows_x86_64/libwebgpu_dawn.dll"
       CACHE FILEPATH "Path to libwebgpu_dawn.dll")
@@ -155,13 +164,27 @@ if(WIN32)
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
             "${LITERT_WEBGPU_ACCELERATOR_DLL}" "${PROUT_DIST_DIR}/"
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
-            "${LITERT_TOPK_WEBGPU_SAMPLER_DLL}" "${PROUT_DIST_DIR}/"
-    COMMAND ${CMAKE_COMMAND} -E copy_if_different
             "${LITERT_WEBGPU_DAWN_DLL}" "${PROUT_DIST_DIR}/"
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
             "${PROUT_DXIL_DLL}" "${PROUT_DIST_DIR}/"
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
             "${PROUT_DXCOMPILER_DLL}" "${PROUT_DIST_DIR}/"
+    COMMAND ${CMAKE_COMMAND}
+            -DSRC="${LITERT_TOPK_WEBGPU_SAMPLER_DLL}"
+            -DDST_DIR="${PROUT_DIST_DIR}"
+            -P "${CMAKE_SOURCE_DIR}/cmake/copy_if_exists.cmake"
+    COMMAND ${CMAKE_COMMAND}
+            -DSRC="${LITERT_TOPK_OPENCL_SAMPLER_DLL}"
+            -DDST_DIR="${PROUT_DIST_DIR}"
+            -P "${CMAKE_SOURCE_DIR}/cmake/copy_if_exists.cmake"
+    COMMAND ${CMAKE_COMMAND}
+            -DSRC="${LITERT_OPENCL_ACCELERATOR_DLL}"
+            -DDST_DIR="${PROUT_DIST_DIR}"
+            -P "${CMAKE_SOURCE_DIR}/cmake/copy_if_exists.cmake"
+    COMMAND ${CMAKE_COMMAND}
+            -DSRC="${LITERT_GPU_ACCELERATOR_DLL}"
+            -DDST_DIR="${PROUT_DIST_DIR}"
+            -P "${CMAKE_SOURCE_DIR}/cmake/copy_if_exists.cmake"
     COMMENT "Staging prout.exe + CPU/GPU LiteRT runtime DLLs into dist/")
 endif()
 

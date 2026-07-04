@@ -33,10 +33,12 @@ public:
 
   ~Arbiter();
 
-  // Starts a negotiation for `service` given the agent's `intent`. On a
-  // question, `*negotiation_id` is set so the caller can resume with Reply.
+  // Starts a negotiation for `service` given the agent's `intent` and optional
+  // command. On a question, `*negotiation_id` is set so the caller can resume
+  // with Reply.
   Verdict Begin(const Service &service, const std::string &agent,
-                const std::string &intent, std::string *negotiation_id);
+                const std::string &intent, const std::string &command_summary,
+                std::string *negotiation_id);
 
   // Continues negotiation `id` with the agent's answer. Returns a denial if the
   // id is unknown or the question budget is exhausted.

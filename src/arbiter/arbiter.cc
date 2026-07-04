@@ -10,6 +10,7 @@
 #include <memory>
 #include <sstream>
 #include <string>
+#include <vector>
 
 #include "nlohmann/json.hpp"
 
@@ -95,7 +96,8 @@ std::string BuildSystemPrompt(const Service &s) {
        "asked to use, validate, reveal, inspect, or receive the credential. "
        "Another process will do the requested task later if Prout grants a "
        "lease. Your only job is to decide whether the agent's stated intent "
-       "deserves a short-lived credential lease under the owner policy.\n\n";
+       "and requested command deserve a short-lived credential lease under "
+       "the owner policy.\n\n";
   o << "Stored credential description: "
     << (p.description.empty() ? s.name : p.description) << "\n";
   o << "Policy ceilings (code clamps these): max_ttl_seconds="
@@ -105,12 +107,15 @@ std::string BuildSystemPrompt(const Service &s) {
   o << "\nDo not ask for the credential value. Do not deny merely because you "
        "cannot access websites or APIs; the requester, not you, will perform "
        "the external action. Granting is the normal outcome for a concrete, "
-       "benign, service-relevant intent. Deny only if the intent is abusive, "
-       "contradictory, impossible for this credential, or nonsensical. Ask a "
-       "question only if the intent is too vague to size a lease. A request "
-       "to validate/check a stored token against its own service is normally a "
-       "read-only diagnostic intent; if the exact endpoint or command is "
-       "unclear, ask for those details instead of denying.\n\n"
+       "benign, service-relevant intent and command. Deny if the intent or "
+       "command is abusive, contradictory, impossible for this credential, "
+       "nonsensical, targets an unrelated service or host, exfiltrates the "
+       "credential, or performs destructive work not justified by the stated "
+       "intent. Ask a question only if the intent or command is too vague to "
+       "size a lease. A request to validate/check a stored token against its "
+       "own service is normally a read-only diagnostic intent; if the exact "
+       "endpoint or command is unclear, ask for those details instead of "
+       "denying.\n\n"
        "Call exactly one registered tool: grant_lease, ask_question, or "
        "deny_request. Put the complete rationale in the tool arguments. If "
        "tool calling is unavailable, respond with EXACTLY ONE JSON object and "
@@ -124,7 +129,8 @@ std::string BuildSystemPrompt(const Service &s) {
 }
 
 std::string InitialUserText(const Service &s, const std::string &agent,
-                            const std::string &intent) {
+                            const std::string &intent,
+                            const std::string &command_summary) {
   std::ostringstream o;
   o << "Lease request metadata:\n";
   o << "agent=" << agent << "\n";
@@ -139,8 +145,11 @@ std::string InitialUserText(const Service &s, const std::string &agent,
     o << "delivery_env_var=" << s.inject_env << "\n";
   o << "disclosure=" << DisclosureName(s.disclosure) << "\n";
   o << "intent=" << intent << "\n\n";
-  o << "Decide whether this intent should receive a credential lease. Do not "
-       "perform the task and do not ask for the credential value.";
+  if (!command_summary.empty())
+    o << "requested_command=" << command_summary << "\n\n";
+  o << "Decide whether this intent and requested command should receive a "
+       "credential lease. Do not perform the task and do not ask for the "
+       "credential value.";
   return o.str();
 }
 
@@ -427,7 +436,9 @@ class ArbiterBackend {
 public:
   virtual ~ArbiterBackend() = default;
   virtual Verdict Begin(const Service &, const std::string &agent,
-                        const std::string &intent, std::string *nid) = 0;
+                        const std::string &intent,
+                        const std::string &command_summary,
+                        std::string *nid) = 0;
   virtual Verdict Reply(const std::string &nid, const std::string &answer) = 0;
   virtual bool using_model() const = 0;
 };
@@ -453,7 +464,8 @@ public:
   }
 
   Verdict Begin(const Service &s, const std::string &agent,
-                const std::string &intent, std::string *nid) override {
+                const std::string &intent, const std::string &command_summary,
+                std::string *nid) override {
     std::string id = NewId();
     Neg n;
     n.policy = s.policy;
@@ -461,7 +473,7 @@ public:
     if (!n.conv)
       return Verdict::Deny("arbiter failed to start a conversation");
     negotiations_.emplace(id, std::move(n));
-    return Advance(id, InitialUserText(s, agent, intent), nid);
+    return Advance(id, InitialUserText(s, agent, intent, command_summary), nid);
   }
 
   Verdict Reply(const std::string &nid, const std::string &answer) override {
@@ -566,27 +578,29 @@ private:
 class HeuristicBackend : public ArbiterBackend {
 public:
   Verdict Begin(const Service &s, const std::string &,
-                const std::string &intent, std::string *nid) override {
+                const std::string &intent, const std::string &command_summary,
+                std::string *nid) override {
     std::string t = Lower(intent);
     int words = CountWords(intent);
     if (words < 4 && !asked_once_) {
       asked_once_ = true;
       std::string id = NewId();
-      pending_[id] = s.policy;
+      pending_[id] = Pending{s.policy, s.website_host, command_summary};
       *nid = id;
       return Verdict::Question("What specifically will you do with this "
                                "credential, and for how long?");
     }
-    return Decide(s.policy, t);
+    return Decide(s, t, command_summary);
   }
 
   Verdict Reply(const std::string &nid, const std::string &answer) override {
     auto it = pending_.find(nid);
     if (it == pending_.end())
       return Verdict::Deny("unknown or expired negotiation id");
-    Policy p = it->second;
+    Pending pending = it->second;
     pending_.erase(it);
-    return Decide(p, Lower(answer));
+    return Decide(pending.policy, pending.website_host, Lower(answer),
+                  pending.command_summary);
   }
 
   bool using_model() const override { return false; }
@@ -615,7 +629,65 @@ private:
     return hay.find(needle) != std::string::npos;
   }
 
-  Verdict Decide(const Policy &p, const std::string &t) {
+  static std::vector<std::string> CommandHosts(const std::string &command) {
+    std::vector<std::string> hosts;
+    std::string lower = Lower(command);
+    std::size_t pos = 0;
+    while (true) {
+      std::size_t http = lower.find("http://", pos);
+      std::size_t https = lower.find("https://", pos);
+      std::size_t start =
+          std::min(http == std::string::npos ? lower.size() : http,
+                   https == std::string::npos ? lower.size() : https);
+      if (start == lower.size())
+        break;
+      start += lower.compare(start, 8, "https://") == 0 ? 8 : 7;
+      std::size_t end = lower.find_first_of(" /?#'\"`)", start);
+      std::string host =
+          lower.substr(start, end == std::string::npos ? end : end - start);
+      auto colon = host.find(':');
+      if (colon != std::string::npos)
+        host.erase(colon);
+      while (!host.empty() && host.back() == '.')
+        host.pop_back();
+      if (!host.empty())
+        hosts.push_back(host);
+      if (end == std::string::npos)
+        break;
+      pos = end + 1;
+    }
+    return hosts;
+  }
+
+  static bool CommandTargetsServiceHost(const std::string &website_host,
+                                        const std::string &command) {
+    if (website_host.empty())
+      return true;
+    auto hosts = CommandHosts(command);
+    if (hosts.empty())
+      return true;
+    std::string allowed = Lower(website_host);
+    for (const auto &host : hosts) {
+      if (host != allowed && !(host.size() > allowed.size() &&
+                               host.compare(host.size() - allowed.size(),
+                                            allowed.size(), allowed) == 0 &&
+                               host[host.size() - allowed.size() - 1] == '.'))
+        return false;
+    }
+    return true;
+  }
+
+  Verdict Decide(const Service &s, const std::string &t,
+                 const std::string &command_summary) {
+    return Decide(s.policy, s.website_host, t, command_summary);
+  }
+
+  Verdict Decide(const Policy &p, const std::string &website_host,
+                 const std::string &t, const std::string &command_summary) {
+    if (!CommandTargetsServiceHost(website_host, command_summary))
+      return Verdict::Deny(
+          "command targets a different website host than the service policy "
+          "(heuristic)");
     if (Has(t, "something") || Has(t, "whatever") || t.size() < 8)
       return Verdict::Deny(
           "intent is too vague to size a credential lease (heuristic)");
@@ -635,7 +707,12 @@ private:
   }
 
   bool asked_once_ = false;
-  std::map<std::string, Policy> pending_;
+  struct Pending {
+    Policy policy;
+    std::string website_host;
+    std::string command_summary;
+  };
+  std::map<std::string, Pending> pending_;
 };
 
 // ---------------------------------------------------------------------------
@@ -664,8 +741,9 @@ Arbiter::Create(const std::string &model_path, const std::string &backend) {
 }
 
 Verdict Arbiter::Begin(const Service &s, const std::string &agent,
-                       const std::string &intent, std::string *nid) {
-  return backend_->Begin(s, agent, intent, nid);
+                       const std::string &intent,
+                       const std::string &command_summary, std::string *nid) {
+  return backend_->Begin(s, agent, intent, command_summary, nid);
 }
 Verdict Arbiter::Reply(const std::string &nid, const std::string &answer) {
   return backend_->Reply(nid, answer);
