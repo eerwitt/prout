@@ -4,8 +4,8 @@ Prout is a local credential-lease daemon for AI agents and automation. An agent 
 
 Credentials are stored in an encrypted vault. The daemon decrypts them into locked memory after unlock and serves local CLI requests over an AF_UNIX socket using length-prefixed JSON frames. Credentials may be disclosed only through active leases, in one of two policy modes:
 
-- `inject`: `prout run` receives the credential from the daemon and injects it into the child process environment. The CLI never prints the value.
-- `reveal`: `prout get` prints the value for explicit capture and consumes one lease use.
+- `inject`: `prout run` negotiates approval, then `prout execute` receives the credential from the daemon and injects it into the child process environment. The CLI redacts the credential if the child prints it.
+- `reveal`: `prout expose` negotiates approval, then final `prout expose --conversation <id>` prints the value for explicit capture.
 
 The model recommends; code enforces. Unknown services, malformed arbiter output, unknown verdicts, zero ceilings, bad disclosure modes, and requests exceeding policy ceilings are denied or rejected before credential release.
 
@@ -18,12 +18,17 @@ prout vault list
 
 prout serve [--model <path>] [--backend cpu|gpu] [--vault <dir>]
 
-prout run --service <service> --intent "<why>" [--agent <name>] -- <cmd...>
+prout run --service <service> --intent "<why>" [--agent <name>]
+prout run --conversation <id> --details "<answer>" [--agent <name>]
+prout execute --conversation <approved-id> -- <cmd...>
 prout run --lease <lease-id> [--agent <name>] -- <cmd...>
-prout get --service <service> --intent "<why>" [--agent <name>]
-prout answer <negotiation-id> "<answer>" [--agent <name>] [-- <cmd...>]
+
+prout expose --service <service> --intent "<why>" [--agent <name>]
+prout expose --conversation <id> --details "<answer>" [--agent <name>]
+prout expose --conversation <approved-id>
 
 prout audit tail [--n <count>]
+prout audit conversation <conversation-id>
 prout audit verify
 ```
 
@@ -75,14 +80,14 @@ The Windows build stages `dist/prout.exe`, `litert-lm.dll`, and the LiteRT-LM co
 
 ## Audit Log
 
-Each machine appends only to its own `audit-<machine>.jsonl` file. Records are hash-chained and contain intent, service, verdict, rationale, lease terms, and disclosure mode. Credential values are never written to audit records. `prout audit verify` recomputes the chain and detects manual record corruption.
+Each machine appends only to its own `audit-<machine>.jsonl` file. Records are hash-chained and contain safe metadata: conversation ids, intent/details, service, verdict, rationale, lease terms, disclosure mode, command summaries, child exit codes, and redaction flags. Credential values and raw command output are never written to audit records. `prout audit conversation <id>` shows one conversation newest first, and `prout audit verify` recomputes the chain and detects manual record corruption.
 
 ## Security Invariants
 
 1. Credentials never leave locked memory except across the local IPC/CLI boundary for an authorized lease delivery, and never into logs, audit records, errors, or normal `run` output.
 2. The audit log is append-only. Prout never rewrites, reorders, or truncates existing records.
 3. The model recommends; code enforces. No arbiter verdict authorizes decryption or delivery until validated against service policy.
-4. `inject` and `reveal` are explicit policy modes. `get` is denied for inject-only services.
+4. `inject` and `reveal` are explicit policy modes. `expose` is denied for inject-only services.
 5. `third_party/litert-lm/` is a vendored submodule and is not edited by Prout changes.
 
 ## Roadmap

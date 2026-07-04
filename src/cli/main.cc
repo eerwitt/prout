@@ -13,11 +13,13 @@ void Usage() {
       "commands:\n"
       "  serve [--model <path>] [--backend cpu|gpu] [--vault <dir>]\n"
       "  vault init|add|list ...\n"
-      "  run --service <name> --intent <text> [--agent <name>] -- <cmd...>\n"
+      "  run --service <name> --intent <text> [--agent <name>]\n"
+      "  run --conversation <id> --details <text> [--agent <name>]\n"
       "  run --lease <id> [--agent <name>] -- <cmd...>\n"
-      "  get --service <name> --intent <text> [--agent <name>]\n"
-      "  answer <negotiation-id> <text> [--agent <name>] [-- <cmd...>]\n"
-      "  audit tail|verify [--vault <dir>]\n");
+      "  expose --service <name> --intent <text> [--agent <name>]\n"
+      "  expose --conversation <id> [--details <text>] [--agent <name>]\n"
+      "  execute --conversation <id> -- <cmd...>\n"
+      "  audit tail|verify|conversation [--vault <dir>]\n");
 }
 
 std::vector<std::string> TailArgs(int argc, char **argv) {
@@ -43,10 +45,10 @@ int main(int argc, char **argv) {
     return prout::CmdVault(args);
   if (cmd == "run")
     return prout::CmdRun(args);
-  if (cmd == "get")
-    return prout::CmdGet(args);
-  if (cmd == "answer")
-    return prout::CmdAnswer(args);
+  if (cmd == "expose")
+    return prout::CmdExpose(args);
+  if (cmd == "execute")
+    return prout::CmdExecute(args);
   if (cmd == "audit")
     return prout::CmdAudit(args);
   if (cmd == "help" || cmd == "--help" || cmd == "-h") {

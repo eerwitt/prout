@@ -1,11 +1,9 @@
-// Client-side subcommands. These are thin: build a request, send it to the
-// daemon over the socket, and act on the single JSON reply. The credential,
-// when granted, is received here (the trusted client) and either injected into
-// a child process's environment or printed for `get` -- it is never shown to
-// the calling agent's own output stream for `run`.
+// Client-side subcommands. Negotiation commands only print safe metadata.
+// Credential bytes are requested only by final expose or execute delivery.
 #include <cstdio>
 #include <cstdlib>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "absl/status/status.h"
@@ -18,11 +16,12 @@
 #include "nlohmann/json.hpp"
 
 #if defined(_WIN32)
+#include <fcntl.h>
+#include <io.h>
 #include <process.h>
 #else
 #include <sys/wait.h>
 #include <unistd.h>
-extern char **environ;
 #endif
 
 namespace prout {
@@ -45,36 +44,6 @@ void UnsetEnv(const std::string &name) {
 #endif
 }
 
-// Runs `command` (argv) inheriting the current environment. Returns its exit
-// code, or 127 if it could not be launched.
-int SpawnChild(const std::vector<std::string> &command) {
-  if (command.empty())
-    return 127;
-  std::vector<char *> argv;
-  for (const auto &a : command)
-    argv.push_back(const_cast<char *>(a.c_str()));
-  argv.push_back(nullptr);
-#if defined(_WIN32)
-  intptr_t rc = _spawnvp(_P_WAIT, argv[0], argv.data());
-  if (rc == -1) {
-    std::fprintf(stderr, "prout: failed to run '%s'\n", argv[0]);
-    return 127;
-  }
-  return static_cast<int>(rc);
-#else
-  pid_t pid = fork();
-  if (pid < 0)
-    return 127;
-  if (pid == 0) {
-    execvp(argv[0], argv.data());
-    _exit(127);
-  }
-  int status = 0;
-  waitpid(pid, &status, 0);
-  return WIFEXITED(status) ? WEXITSTATUS(status) : 1;
-#endif
-}
-
 absl::StatusOr<json> Send(const json &request) {
   auto resp = IpcRequest(SocketPath(), request.dump());
   if (!resp.ok())
@@ -85,125 +54,299 @@ absl::StatusOr<json> Send(const json &request) {
   return j;
 }
 
-// Delivers a granted credential either by injecting it into a child's env and
-// running the child (inject mode), or by printing it to stdout (reveal mode).
-int UseGranted(const json &r, const std::vector<std::string> &command) {
-  std::string env_var = r.value("env_var", "");
-  // Copy credential into locked memory, then wipe the JSON's copy.
-  SecureBuffer cred;
-  {
-    std::string c = r.value("credential", "");
-    cred.assign(c);
-    SecureZero(c.data(), c.size());
-  }
-
-  // Status line (no credential) so the agent can see what was granted.
-  std::fprintf(stderr, "prout: granted lease %s  ttl=%us  uses_left=%u  (%s)\n",
-               r.value("lease_id", "?").c_str(), r.value("ttl_seconds", 0u),
-               r.value("uses_remaining", 0u), r.value("rationale", "").c_str());
-
-  if (!command.empty()) {
-    SetEnv(env_var, cred.c_str());
-    int code = SpawnChild(command);
-    UnsetEnv(env_var);
-    cred.clear();
-    return code;
-  }
-  if (r.value("disclosure", "inject") != "reveal") {
-    std::fprintf(stderr, "prout: granted credential is inject-only; no child "
-                         "command was provided\n");
-    cred.clear();
-    return kExitError;
-  }
-  // Reveal mode: emit the raw value on stdout for capture.
-  std::fwrite(cred.data(), 1, cred.size(), stdout);
-  std::fputc('\n', stdout);
-  cred.clear();
-  return kExitOk;
-}
-
-// Prints a non-granted reply and maps it to an exit code.
-int ReportNonGrant(const json &r) {
+int ReportMetadata(const json &r) {
   std::string status = r.value("status", "error");
-  // Echo the reply as-is (never contains a credential for these statuses).
   std::fprintf(stdout, "%s\n", r.dump().c_str());
   if (status == "question")
     return kExitQuestion;
   if (status == "denied")
     return kExitDenied;
-  return kExitError;
+  if (status == "error")
+    return kExitError;
+  return kExitOk;
 }
 
-int Dispatch(const json &request, const std::vector<std::string> &command) {
+int DispatchMetadata(const json &request) {
   auto r = Send(request);
   if (!r.ok()) {
     std::fprintf(stderr, "prout: %s\n",
                  std::string(r.status().message()).c_str());
     return kExitError;
   }
-  if (r->value("status", "") == "granted")
-    return UseGranted(*r, command);
-  return ReportNonGrant(*r);
+  return ReportMetadata(*r);
+}
+
+std::string JoinCommand(const std::vector<std::string> &command) {
+  std::string out;
+  for (const auto &part : command) {
+    if (!out.empty())
+      out += " ";
+    out += part;
+  }
+  return out;
+}
+
+class Redactor {
+public:
+  explicit Redactor(std::string secret) : secret_(std::move(secret)) {}
+
+  void Write(const char *data, std::size_t size) {
+    if (secret_.empty()) {
+      std::fwrite(data, 1, size, stdout);
+      return;
+    }
+    pending_.append(data, size);
+    Drain(false);
+  }
+
+  void Finish() { Drain(true); }
+  bool redacted() const { return redacted_; }
+
+private:
+  void Drain(bool finish) {
+    while (true) {
+      std::size_t pos = pending_.find(secret_);
+      if (pos != std::string::npos) {
+        std::fwrite(pending_.data(), 1, pos, stdout);
+        std::string stars(secret_.size(), '*');
+        std::fwrite(stars.data(), 1, stars.size(), stdout);
+        pending_.erase(0, pos + secret_.size());
+        redacted_ = true;
+        continue;
+      }
+      const std::size_t keep = finish ? 0 : secret_.size() - 1;
+      if (pending_.size() <= keep)
+        return;
+      const std::size_t emit = pending_.size() - keep;
+      std::fwrite(pending_.data(), 1, emit, stdout);
+      pending_.erase(0, emit);
+      return;
+    }
+  }
+
+  std::string secret_;
+  std::string pending_;
+  bool redacted_ = false;
+};
+
+int SpawnChildFiltered(const std::vector<std::string> &command,
+                       const std::string &env_var, SecureBuffer &cred,
+                       bool *redacted) {
+  if (command.empty())
+    return 127;
+  std::vector<char *> argv;
+  for (const auto &a : command)
+    argv.push_back(const_cast<char *>(a.c_str()));
+  argv.push_back(nullptr);
+
+  int pipefd[2];
+#if defined(_WIN32)
+  if (_pipe(pipefd, 4096, _O_BINARY) != 0)
+    return 127;
+  int saved_out = _dup(_fileno(stdout));
+  int saved_err = _dup(_fileno(stderr));
+  _dup2(pipefd[1], _fileno(stdout));
+  _dup2(pipefd[1], _fileno(stderr));
+  _close(pipefd[1]);
+  SetEnv(env_var, cred.c_str());
+  intptr_t child = _spawnvp(_P_NOWAIT, argv[0], argv.data());
+  UnsetEnv(env_var);
+  _dup2(saved_out, _fileno(stdout));
+  _dup2(saved_err, _fileno(stderr));
+  _close(saved_out);
+  _close(saved_err);
+  if (child == -1) {
+    _close(pipefd[0]);
+    std::fprintf(stderr, "prout: failed to run '%s'\n", argv[0]);
+    return 127;
+  }
+  Redactor filter(std::string(cred.c_str(), cred.size()));
+  std::thread reader([&] {
+    char buf[4096];
+    int n = 0;
+    while ((n = _read(pipefd[0], buf, sizeof(buf))) > 0)
+      filter.Write(buf, static_cast<std::size_t>(n));
+    _close(pipefd[0]);
+  });
+  int status = 0;
+  _cwait(&status, child, 0);
+  reader.join();
+  filter.Finish();
+  if (redacted)
+    *redacted = filter.redacted();
+  return status;
+#else
+  if (pipe(pipefd) != 0)
+    return 127;
+  SetEnv(env_var, cred.c_str());
+  pid_t pid = fork();
+  if (pid < 0) {
+    UnsetEnv(env_var);
+    close(pipefd[0]);
+    close(pipefd[1]);
+    return 127;
+  }
+  if (pid == 0) {
+    close(pipefd[0]);
+    dup2(pipefd[1], STDOUT_FILENO);
+    dup2(pipefd[1], STDERR_FILENO);
+    close(pipefd[1]);
+    execvp(argv[0], argv.data());
+    _exit(127);
+  }
+  UnsetEnv(env_var);
+  close(pipefd[1]);
+  Redactor filter(std::string(cred.c_str(), cred.size()));
+  std::thread reader([&] {
+    char buf[4096];
+    ssize_t n = 0;
+    while ((n = read(pipefd[0], buf, sizeof(buf))) > 0)
+      filter.Write(buf, static_cast<std::size_t>(n));
+    close(pipefd[0]);
+  });
+  int status = 0;
+  waitpid(pid, &status, 0);
+  reader.join();
+  filter.Finish();
+  if (redacted)
+    *redacted = filter.redacted();
+  return WIFEXITED(status) ? WEXITSTATUS(status) : 1;
+#endif
+}
+
+int ExecuteDelivery(const json &r, const std::vector<std::string> &command) {
+  std::string env_var = r.value("env_var", "");
+  std::string conversation_id = r.value("conversation_id", "");
+  SecureBuffer cred;
+  {
+    std::string c = r.value("credential", "");
+    cred.assign(c);
+    SecureZero(c.data(), c.size());
+  }
+  bool redacted = false;
+  int code = SpawnChildFiltered(command, env_var, cred, &redacted);
+  cred.clear();
+  auto ack = Send({{"op", "execute_result"},
+                   {"conversation_id", conversation_id},
+                   {"child_exit_code", code},
+                   {"redacted", redacted}});
+  (void)ack;
+  return code;
 }
 
 } // namespace
 
 int CmdRun(const std::vector<std::string> &argv) {
   Args a = ParseArgs(argv);
-  std::string service = a.Get("service");
-  if (!a.Has("lease") && service.empty()) {
-    std::fprintf(
-        stderr, "usage: prout run --service <s> --intent \"<why>\" "
-                "[--agent <name>] -- <cmd...>\n"
-                "       prout run --lease <id> [--agent <name>] -- <cmd...>\n");
-    return kExitError;
-  }
-  if (a.command.empty()) {
-    std::fprintf(stderr, "prout: run requires a command after `--`\n");
-    return kExitError;
+  if (a.Has("lease")) {
+    if (a.command.empty()) {
+      std::fprintf(stderr,
+                   "prout: run --lease requires a command after `--`\n");
+      return kExitError;
+    }
+    json req = {{"op", "reuse"},
+                {"lease_id", a.Get("lease")},
+                {"agent", a.Get("agent", "agent")}};
+    auto r = Send(req);
+    if (!r.ok()) {
+      std::fprintf(stderr, "prout: %s\n",
+                   std::string(r.status().message()).c_str());
+      return kExitError;
+    }
+    if (r->value("status", "") != "deliver")
+      return ReportMetadata(*r);
+    return ExecuteDelivery(*r, a.command);
   }
 
-  json req;
-  if (a.Has("lease")) {
-    req = {{"op", "reuse"},
-           {"lease_id", a.Get("lease")},
-           {"agent", a.Get("agent", "agent")}};
-  } else {
-    req = {{"op", "run"},
-           {"service", service},
-           {"intent", a.Get("intent")},
-           {"agent", a.Get("agent", "agent")}};
+  if (a.Has("conversation")) {
+    if (!a.Has("details")) {
+      std::fprintf(stderr, "usage: prout run --conversation <id> --details "
+                           "<text> [--agent <name>]\n");
+      return kExitError;
+    }
+    return DispatchMetadata({{"op", "continue"},
+                             {"kind", "run"},
+                             {"conversation_id", a.Get("conversation")},
+                             {"details", a.Get("details")},
+                             {"agent", a.Get("agent", "agent")}});
   }
-  return Dispatch(req, a.command);
+
+  std::string service = a.Get("service");
+  if (service.empty() || !a.Has("intent")) {
+    std::fprintf(
+        stderr,
+        "usage: prout run --service <s> --intent \"<why>\" [--agent <name>]\n");
+    return kExitError;
+  }
+  return DispatchMetadata({{"op", "negotiate"},
+                           {"kind", "run"},
+                           {"service", service},
+                           {"intent", a.Get("intent")},
+                           {"agent", a.Get("agent", "agent")}});
 }
 
-int CmdGet(const std::vector<std::string> &argv) {
+int CmdExpose(const std::vector<std::string> &argv) {
   Args a = ParseArgs(argv);
+  if (a.Has("conversation") && !a.Has("details")) {
+    auto r = Send({{"op", "expose_final"},
+                   {"conversation_id", a.Get("conversation")},
+                   {"agent", a.Get("agent", "agent")}});
+    if (!r.ok()) {
+      std::fprintf(stderr, "prout: %s\n",
+                   std::string(r.status().message()).c_str());
+      return kExitError;
+    }
+    if (r->value("status", "") != "deliver")
+      return ReportMetadata(*r);
+    SecureBuffer cred;
+    {
+      std::string c = r->value("credential", "");
+      cred.assign(c);
+      SecureZero(c.data(), c.size());
+    }
+    std::fwrite(cred.data(), 1, cred.size(), stdout);
+    std::fputc('\n', stdout);
+    cred.clear();
+    return kExitOk;
+  }
+  if (a.Has("conversation")) {
+    return DispatchMetadata({{"op", "continue"},
+                             {"kind", "expose"},
+                             {"conversation_id", a.Get("conversation")},
+                             {"details", a.Get("details")},
+                             {"agent", a.Get("agent", "agent")}});
+  }
   std::string service = a.Get("service");
-  if (service.empty()) {
-    std::fprintf(stderr, "usage: prout get --service <s> --intent \"<why>\" "
+  if (service.empty() || !a.Has("intent")) {
+    std::fprintf(stderr, "usage: prout expose --service <s> --intent \"<why>\" "
                          "[--agent <name>]\n");
     return kExitError;
   }
-  json req = {{"op", "get"},
-              {"service", service},
-              {"intent", a.Get("intent")},
-              {"agent", a.Get("agent", "agent")}};
-  return Dispatch(req, /*command=*/{});
+  return DispatchMetadata({{"op", "negotiate"},
+                           {"kind", "expose"},
+                           {"service", service},
+                           {"intent", a.Get("intent")},
+                           {"agent", a.Get("agent", "agent")}});
 }
 
-int CmdAnswer(const std::vector<std::string> &argv) {
+int CmdExecute(const std::vector<std::string> &argv) {
   Args a = ParseArgs(argv);
-  if (a.positional.size() < 2) {
-    std::fprintf(stderr, "usage: prout answer <negotiation-id> \"<text>\" "
-                         "[-- <cmd...>]\n");
+  if (!a.Has("conversation") || a.command.empty()) {
+    std::fprintf(stderr,
+                 "usage: prout execute --conversation <id> -- <cmd...>\n");
     return kExitError;
   }
-  json req = {{"op", "answer"},
-              {"negotiation_id", a.positional[0]},
-              {"answer", a.positional[1]},
-              {"agent", a.Get("agent", "agent")}};
-  return Dispatch(req, a.command);
+  auto r = Send({{"op", "execute"},
+                 {"conversation_id", a.Get("conversation")},
+                 {"command_summary", JoinCommand(a.command)}});
+  if (!r.ok()) {
+    std::fprintf(stderr, "prout: %s\n",
+                 std::string(r.status().message()).c_str());
+    return kExitError;
+  }
+  if (r->value("status", "") != "deliver")
+    return ReportMetadata(*r);
+  return ExecuteDelivery(*r, a.command);
 }
 
 } // namespace prout

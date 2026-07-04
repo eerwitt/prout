@@ -48,11 +48,11 @@ CMake locates `clang-format` from `PATH` or the Visual Studio Community LLVM too
 
 - `prout vault init/add/list` manages an encrypted local vault.
 - `prout serve` unlocks the vault, creates the arbiter, listens on `PROUT_SOCKET`, and owns all active leases.
-- `prout run --service ... --intent ... -- <cmd...>` negotiates a lease and injects the credential into only the child environment for `disclosure=inject` services.
-- `prout run --lease <id> -- <cmd...>` reuses an active daemon lease without requiring the client to restate the service.
-- `prout get --service ... --intent ...` reveals only services whose policy says `disclosure=reveal`.
-- `prout answer <id> ...` resumes a question negotiation and can run the child command on grant.
-- `prout audit tail/verify` reads this machine's audit log and verifies the hash chain.
+- `prout run --service ... --intent ...` and `prout run --conversation ... --details ...` negotiate only and return safe JSON metadata with transient conversation ids.
+- `prout execute --conversation <approved-id> -- <cmd...>` consumes an approved run conversation, injects the credential into only the child environment for `disclosure=inject` services, and redacts leaked credential bytes in child output.
+- `prout run --lease <id> -- <cmd...>` remains as compatibility reuse for active daemon leases.
+- `prout expose --service ... --intent ...` negotiates reveal-mode approval; final `prout expose --conversation <approved-id>` consumes the approved expose conversation and prints the credential.
+- `prout audit tail/verify/conversation` reads this machine's audit log, verifies the hash chain, and shows safe conversation metadata newest first.
 
 Exit codes: `0` success, `1` error, `10` question, `11` denied.
 
@@ -68,7 +68,7 @@ The parser accepts only the `type` schema. Code clamps TTL and uses to policy ce
 
 ## Security Invariants
 
-1. Credentials never leave locked memory except inside an authorized lease delivery. Do not put credentials in stdout/stderr except `prout get` for reveal-mode services, logs, audit records, errors, docs, or tests.
+1. Credentials never leave locked memory except inside an authorized request. Do not put credentials in stdout/stderr except final `prout expose --conversation <approved-id>` for reveal-mode services, logs, audit records, errors, docs, or tests.
 2. The audit log is append-only. Never rewrite, reorder, or truncate existing records; each machine writes only to its own `audit-<machine>.jsonl`.
 3. The model recommends; code enforces. Unknown services, malformed model JSON, unknown verdicts, bad disclosure modes, or zero ceilings must deny/error before credential release.
 4. Do not modify `third_party/litert-lm/`; use only the LiteRT-LM C ABI in `c/engine.h`.

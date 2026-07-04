@@ -69,15 +69,22 @@ absl::Status AuditLog::Append(const AuditEntry &e) {
   nlohmann::ordered_json rec;
   rec["ts"] = NowIso8601();
   rec["machine"] = machine_;
+  rec["conversation_id"] = e.conversation_id;
+  rec["event"] = e.event;
   rec["agent"] = e.agent;
   rec["service"] = e.service;
   rec["intent"] = e.intent;
+  rec["details"] = e.details;
+  rec["command_summary"] = e.command_summary;
   rec["transcript"] = e.transcript;
   rec["verdict"] = e.verdict;
   rec["rationale"] = e.rationale;
   rec["ttl_seconds"] = e.ttl_seconds;
   rec["max_uses"] = e.max_uses;
   rec["disclosure"] = e.disclosure;
+  rec["child_exit_code"] = e.child_exit_code;
+  rec["redacted"] = e.redacted;
+  rec["prout_error"] = e.prout_error;
   rec["prev_hash"] = prev;
   rec["hash"] = Blake2bHex(prev, Canonical(rec));
 
@@ -115,6 +122,53 @@ absl::StatusOr<std::vector<std::string>> AuditLog::Tail(int n) const {
     if (j.value("verdict", "") == "granted")
       s << "  [ttl=" << j.value("ttl_seconds", 0)
         << "s uses=" << j.value("max_uses", 0) << "]";
+    out.push_back(s.str());
+  }
+  return out;
+}
+
+absl::StatusOr<std::vector<std::string>>
+AuditLog::Conversation(const std::string &conversation_id) const {
+  std::ifstream f(Path());
+  if (!f)
+    return std::vector<std::string>{};
+  std::vector<std::string> lines;
+  std::string line;
+  while (std::getline(f, line))
+    if (!line.empty())
+      lines.push_back(line);
+
+  std::vector<std::string> out;
+  for (auto it = lines.rbegin(); it != lines.rend(); ++it) {
+    json j = json::parse(*it, nullptr, false);
+    if (j.is_discarded() || j.value("conversation_id", "") != conversation_id)
+      continue;
+    std::ostringstream s;
+    s << j.value("ts", "?") << "  " << j.value("event", "?") << "  "
+      << j.value("verdict", "?") << "  " << j.value("agent", "?") << " -> "
+      << j.value("service", "?");
+    std::string intent = j.value("intent", "");
+    if (!intent.empty())
+      s << "  intent=\"" << intent << "\"";
+    std::string details = j.value("details", "");
+    if (!details.empty())
+      s << "  details=\"" << details << "\"";
+    std::string cmd = j.value("command_summary", "");
+    if (!cmd.empty())
+      s << "  cmd=\"" << cmd << "\"";
+    std::string rat = j.value("rationale", "");
+    if (!rat.empty())
+      s << "  (" << rat << ")";
+    if (j.value("ttl_seconds", 0) > 0)
+      s << "  [ttl=" << j.value("ttl_seconds", 0)
+        << "s uses=" << j.value("max_uses", 0) << "]";
+    if (j.value("child_exit_code", -1) >= 0)
+      s << "  exit=" << j.value("child_exit_code", -1);
+    if (j.value("redacted", false))
+      s << "  redacted=true";
+    std::string err = j.value("prout_error", "");
+    if (!err.empty())
+      s << "  prout_error=\"" << err << "\"";
     out.push_back(s.str());
   }
   return out;

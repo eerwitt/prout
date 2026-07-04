@@ -13,7 +13,8 @@ namespace {
 void AuditUsage() {
   std::fprintf(stderr, "usage:\n"
                        "  prout audit tail [--vault <dir>] [--n <count>]\n"
-                       "  prout audit verify [--vault <dir>]\n");
+                       "  prout audit verify [--vault <dir>]\n"
+                       "  prout audit conversation <id> [--vault <dir>]\n");
 }
 
 int ParseInt(const std::string &s, int def) {
@@ -40,6 +41,22 @@ int CmdAudit(const std::vector<std::string> &argv) {
 
   if (sub == "tail") {
     auto lines = log.Tail(ParseInt(a.Get("n"), 20));
+    if (!lines.ok()) {
+      std::fprintf(stderr, "prout: %s\n",
+                   std::string(lines.status().message()).c_str());
+      return kExitError;
+    }
+    for (const auto &line : *lines)
+      std::fprintf(stdout, "%s\n", line.c_str());
+    return kExitOk;
+  }
+
+  if (sub == "conversation") {
+    if (a.positional.empty()) {
+      AuditUsage();
+      return kExitError;
+    }
+    auto lines = log.Conversation(a.positional[0]);
     if (!lines.ok()) {
       std::fprintf(stderr, "prout: %s\n",
                    std::string(lines.status().message()).c_str());

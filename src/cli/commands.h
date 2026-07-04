@@ -9,10 +9,10 @@ namespace prout {
 
 int CmdServe(const std::vector<std::string> &args);  // daemon
 int CmdVault(const std::vector<std::string> &args);  // init/add/list (offline)
-int CmdRun(const std::vector<std::string> &args);    // negotiate -> exec child
-int CmdGet(const std::vector<std::string> &args);    // negotiate -> print value
-int CmdAnswer(const std::vector<std::string> &args); // resume a negotiation
-int CmdAudit(const std::vector<std::string> &args);  // tail / verify
+int CmdRun(const std::vector<std::string> &args);    // negotiate only
+int CmdExpose(const std::vector<std::string> &args); // negotiate -> print value
+int CmdExecute(const std::vector<std::string> &args); // approved run -> exec
+int CmdAudit(const std::vector<std::string> &args);   // tail / verify
 
 // Exit codes shared by client commands so agents can branch on them.
 inline constexpr int kExitOk = 0;

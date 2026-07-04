@@ -1,10 +1,16 @@
 // The long-lived daemon: loads the vault + keeps Gemma warm, then serves
 // negotiation requests over the AF_UNIX socket. Single-threaded and serialized
 // -- one model, one user -- which keeps lease state trivially consistent.
+#include <algorithm>
+#include <array>
 #include <atomic>
+#include <chrono>
+#include <cctype>
 #include <csignal>
 #include <cstdio>
+#include <map>
 #include <memory>
+#include <sstream>
 #include <string>
 
 #include "arbiter/arbiter.h"
@@ -17,6 +23,7 @@
 #include "daemon/lease.h"
 #include "ipc/ipc.h"
 #include "nlohmann/json.hpp"
+#include "vault/crypto.h"
 #include "vault/vault.h"
 
 namespace prout {
@@ -27,11 +34,54 @@ namespace {
 std::atomic<bool> g_stop{false};
 void OnSignal(int) { g_stop.store(true); }
 
-struct Pending {
+std::string Lower(std::string s) {
+  std::transform(s.begin(), s.end(), s.begin(), [](unsigned char c) {
+    return static_cast<char>(std::tolower(c));
+  });
+  return s;
+}
+
+bool Has(const std::string &s, const std::string &needle) {
+  return s.find(needle) != std::string::npos;
+}
+
+std::string NewConversationId() {
+  std::array<std::uint8_t, 32> bytes{};
+  if (!RandomBytes(bytes.data(), bytes.size()).ok())
+    return "conv-random-failed";
+  return "conv-" + ToHex(bytes.data(), bytes.size());
+}
+
+std::string LeaseReason(LeaseTable::Status st) {
+  switch (st) {
+  case LeaseTable::Status::kUnknown:
+    return "no such lease";
+  case LeaseTable::Status::kExpired:
+    return "lease expired";
+  case LeaseTable::Status::kExhausted:
+    return "lease fully used";
+  case LeaseTable::Status::kWrongService:
+    return "lease is for a different service";
+  case LeaseTable::Status::kOk:
+    return "";
+  }
+  return "lease denied";
+}
+
+struct Conversation {
+  std::string id;
+  std::string kind; // "run" or "expose"
   std::string service;
-  std::string op; // "run" or "get"
   std::string agent;
   std::string intent;
+  std::string details;
+  std::string arbiter_id;
+  std::string rationale;
+  std::uint32_t ttl_seconds = 0;
+  std::uint32_t max_uses = 0;
+  bool approved = false;
+  bool delivered = false;
+  std::chrono::steady_clock::time_point expires_at;
 };
 
 class Daemon {
@@ -45,13 +95,18 @@ public:
     if (req.is_discarded())
       return Error("malformed request");
     std::string op = req.value("op", "");
-    if (op == "ping") {
+    if (op == "ping")
       return json{{"status", "ok"}, {"model", arbiter_->using_model()}}.dump();
-    }
-    if (op == "run" || op == "get")
-      return Negotiate(op, req);
-    if (op == "answer")
-      return Answer(req);
+    if (op == "negotiate")
+      return Negotiate(req);
+    if (op == "continue")
+      return Continue(req);
+    if (op == "execute")
+      return Execute(req);
+    if (op == "execute_result")
+      return ExecuteResult(req);
+    if (op == "expose_final")
+      return ExposeFinal(req);
     if (op == "reuse")
       return Reuse(req);
     return Error("unknown op '" + op + "'");
@@ -62,39 +117,130 @@ private:
     return json{{"status", "error"}, {"message", m}}.dump();
   }
 
-  // Builds a granted response, creating a lease and consuming its first use.
-  std::string Grant(const Service &s, const std::string &op, std::uint32_t ttl,
-                    std::uint32_t uses, const std::string &rationale) {
-    if (ttl == 0 || uses == 0)
-      return Deny(s.name, "invalid zero lease ceiling");
-    auto lease_id_or = leases_.Create(s.name, ttl, uses);
+  absl::Status Audit(const AuditEntry &entry) { return audit_.Append(entry); }
+
+  std::string AuditError(const absl::Status &st) {
+    return Error("could not append audit record: " + std::string(st.message()));
+  }
+
+  std::string Deny(const Conversation &c, const std::string &rationale,
+                   const std::string &event = "deny",
+                   const std::string &command_summary = "") {
+    auto st = Audit(AuditEntry{.conversation_id = c.id,
+                               .event = event,
+                               .agent = c.agent,
+                               .service = c.service,
+                               .intent = c.intent,
+                               .details = c.details,
+                               .command_summary = command_summary,
+                               .transcript = Transcript(c),
+                               .verdict = "denied",
+                               .rationale = rationale});
+    if (!st.ok())
+      return AuditError(st);
+    return json{{"status", "denied"},
+                {"conversation_id", c.id},
+                {"rationale", rationale}}
+        .dump();
+  }
+
+  std::string Question(Conversation c, const std::string &question) {
+    std::string old_id = c.id;
+    c.id = NewConversationId();
+    c.approved = false;
+    c.expires_at = std::chrono::steady_clock::now() + std::chrono::minutes(10);
+    conversations_[c.id] = c;
+    conversations_.erase(old_id);
+    auto st = Audit(AuditEntry{.conversation_id = c.id,
+                               .event = "question",
+                               .agent = c.agent,
+                               .service = c.service,
+                               .intent = c.intent,
+                               .details = c.details,
+                               .transcript = "question: " + question,
+                               .verdict = "question",
+                               .rationale = question});
+    if (!st.ok())
+      return AuditError(st);
+    return json{{"status", "question"},
+                {"conversation_id", c.id},
+                {"question", question}}
+        .dump();
+  }
+
+  std::string Grant(Conversation c, const Service &s, const Verdict &v) {
+    if (s.policy.max_ttl_seconds == 0 || s.policy.max_uses == 0)
+      return Deny(c, "service policy has zero lease ceiling");
+    if (c.kind == "expose" && s.disclosure != Disclosure::kReveal)
+      return Deny(c,
+                  "service '" + s.name +
+                      "' does not permit revealing its value; use `prout run`");
+    c.id = NewConversationId();
+    c.approved = true;
+    c.delivered = false;
+    c.rationale = v.rationale;
+    c.ttl_seconds = v.ttl_seconds;
+    c.max_uses = v.max_uses;
+    c.expires_at =
+        std::chrono::steady_clock::now() + std::chrono::seconds(v.ttl_seconds);
+    auto lease_id_or = leases_.Create(c.service, c.ttl_seconds, c.max_uses);
     if (!lease_id_or.ok())
       return Error("could not create lease: " +
                    std::string(lease_id_or.status().message()));
     std::string lease_id = *lease_id_or;
-    std::uint32_t left = 0;
-    leases_.Consume(lease_id, s.name, &left); // this delivery counts as a use
+    conversations_[c.id] = c;
+    auto st = Audit(AuditEntry{.conversation_id = c.id,
+                               .event = "grant",
+                               .agent = c.agent,
+                               .service = c.service,
+                               .intent = c.intent,
+                               .details = c.details,
+                               .transcript = Transcript(c),
+                               .verdict = "granted",
+                               .rationale = c.rationale,
+                               .ttl_seconds = c.ttl_seconds,
+                               .max_uses = c.max_uses,
+                               .disclosure = DisclosureName(s.disclosure)});
+    if (!st.ok())
+      return AuditError(st);
+    return json{
+        {"status", "granted"},     {"conversation_id", c.id},
+        {"lease_id", lease_id},    {"service", c.service},
+        {"kind", c.kind},          {"ttl_seconds", c.ttl_seconds},
+        {"max_uses", c.max_uses},  {"disclosure", DisclosureName(s.disclosure)},
+        {"rationale", c.rationale}}
+        .dump();
+  }
 
-    auto audit_status =
-        audit_.Append(AuditEntry{.agent = last_agent_,
-                                 .service = s.name,
-                                 .intent = last_intent_,
-                                 .transcript = last_transcript_,
-                                 .verdict = "granted",
-                                 .rationale = rationale,
-                                 .ttl_seconds = ttl,
-                                 .max_uses = uses,
-                                 .disclosure = DisclosureName(s.disclosure)});
-    if (!audit_status.ok())
-      return Error("could not append audit record: " +
-                   std::string(audit_status.message()));
+  std::string Transcript(const Conversation &c) const {
+    if (c.details.empty())
+      return "intent: " + c.intent;
+    return "intent: " + c.intent + " | details: " + c.details;
+  }
 
+  bool Expired(const Conversation &c) const {
+    return std::chrono::steady_clock::now() >= c.expires_at;
+  }
+
+  bool CommandFits(const Conversation &c, const std::string &command) const {
+    std::string text = Lower(c.intent + " " + c.details);
+    std::string cmd = Lower(command);
+    bool read_only = Has(text, "read") || Has(text, "check") ||
+                     Has(text, "verify") || Has(text, "list") ||
+                     Has(text, "debug") || Has(text, "diagnostic");
+    bool mutating = Has(cmd, "set-content") || Has(cmd, "remove-item") ||
+                    Has(cmd, " rm ") || Has(cmd, " del ") ||
+                    Has(cmd, "delete") || Has(cmd, "write") ||
+                    Has(cmd, "update");
+    return !(read_only && mutating);
+  }
+
+  std::string DeliverCredential(const Conversation &c, const Service &s) {
     std::string credential(reinterpret_cast<const char *>(s.credential.data()),
                            s.credential.size());
     json r{
-        {"status", "granted"},     {"lease_id", lease_id},
-        {"ttl_seconds", ttl},      {"max_uses", uses},
-        {"uses_remaining", left},  {"rationale", rationale},
+        {"status", "deliver"},     {"conversation_id", c.id},
+        {"service", c.service},    {"kind", c.kind},
         {"env_var", s.env_var},    {"disclosure", DisclosureName(s.disclosure)},
         {"credential", credential}};
     std::string out = r.dump();
@@ -102,160 +248,208 @@ private:
     return out;
   }
 
-  std::string Deny(const std::string &service, const std::string &rationale) {
-    auto audit_status = audit_.Append(AuditEntry{.agent = last_agent_,
-                                                 .service = service,
-                                                 .intent = last_intent_,
-                                                 .transcript = last_transcript_,
-                                                 .verdict = "denied",
-                                                 .rationale = rationale});
-    if (!audit_status.ok())
-      return Error("could not append audit record: " +
-                   std::string(audit_status.message()));
-    return json{{"status", "denied"}, {"rationale", rationale}}.dump();
-  }
-
-  std::string AskQuestion(const std::string &service, const std::string &nid,
-                          const std::string &text) {
-    auto audit_status =
-        audit_.Append(AuditEntry{.agent = last_agent_,
-                                 .service = service,
-                                 .intent = last_intent_,
-                                 .transcript = "question: " + text,
-                                 .verdict = "question",
-                                 .rationale = text});
-    if (!audit_status.ok())
-      return Error("could not append audit record: " +
-                   std::string(audit_status.message()));
-    return json{{"status", "question"}, {"negotiation_id", nid}, {"text", text}}
-        .dump();
-  }
-
-  std::string Deliver(const Service &s, const std::string &op,
-                      const Verdict &v) {
-    if (s.policy.max_ttl_seconds == 0 || s.policy.max_uses == 0)
-      return Deny(s.name, "service policy has zero lease ceiling");
-    if (op == "get" && s.disclosure != Disclosure::kReveal)
-      return Deny(s.name,
-                  "service '" + s.name +
-                      "' does not permit revealing its value; use `prout run`");
-    return Grant(s, op, v.ttl_seconds, v.max_uses, v.rationale);
-  }
-
-  std::string Negotiate(const std::string &op, const json &req) {
-    std::string service = req.value("service", "");
-    last_agent_ = req.value("agent", "agent");
-    last_intent_ = req.value("intent", "");
-    last_transcript_ = "intent: " + last_intent_;
-
-    const Service *s = vault_.Find(service);
+  std::string Negotiate(const json &req) {
+    Conversation c;
+    c.id = NewConversationId();
+    c.kind = req.value("kind", "run");
+    c.service = req.value("service", "");
+    c.agent = req.value("agent", "agent");
+    c.intent = req.value("intent", "");
+    c.expires_at = std::chrono::steady_clock::now() + std::chrono::minutes(10);
+    if (c.kind != "run" && c.kind != "expose")
+      return Error("invalid conversation kind");
+    const Service *s = vault_.Find(c.service);
     if (!s)
-      return Error("unknown service '" + service + "'");
-    if (last_intent_.empty())
+      return Error("unknown service '" + c.service + "'");
+    if (c.intent.empty())
       return Error("missing intent");
 
-    std::string nid;
-    Verdict v = arbiter_->Begin(*s, last_agent_, last_intent_, &nid);
-    if (v.type == Verdict::Type::kQuestion) {
-      pending_[nid] = Pending{service, op, last_agent_, last_intent_};
-      return AskQuestion(service, nid, v.question);
-    }
+    std::string arbiter_id;
+    Verdict v = arbiter_->Begin(*s, c.agent, c.intent, &arbiter_id);
+    c.arbiter_id = arbiter_id;
+    if (v.type == Verdict::Type::kQuestion)
+      return Question(c, v.question);
     if (v.type == Verdict::Type::kDeny)
-      return Deny(service, v.rationale);
-    return Deliver(*s, op, v);
+      return Deny(c, v.rationale);
+    return Grant(c, *s, v);
   }
 
-  std::string Answer(const json &req) {
-    std::string nid = req.value("negotiation_id", "");
-    std::string answer = req.value("answer", "");
-    auto it = pending_.find(nid);
-    if (it == pending_.end())
-      return Error("unknown or expired negotiation id '" + nid + "'");
-    Pending ctx = it->second;
-    last_agent_ = ctx.agent;
-    last_intent_ = ctx.intent;
-    last_transcript_ = "intent: " + ctx.intent + " | answer: " + answer;
-
-    const Service *s = vault_.Find(ctx.service);
-    if (!s) {
-      pending_.erase(it);
+  std::string Continue(const json &req) {
+    std::string id = req.value("conversation_id", "");
+    auto it = conversations_.find(id);
+    if (it == conversations_.end())
+      return Error("unknown or expired conversation id '" + id + "'");
+    Conversation c = it->second;
+    conversations_.erase(it);
+    if (Expired(c))
+      return Deny(c, "conversation expired");
+    if (c.approved)
+      return Error("conversation is already approved");
+    std::string kind = req.value("kind", c.kind);
+    if (kind != c.kind)
+      return Deny(c, "conversation kind mismatch");
+    c.agent = req.value("agent", c.agent);
+    c.details = req.value("details", "");
+    if (c.details.empty())
+      return Error("missing details");
+    const Service *s = vault_.Find(c.service);
+    if (!s)
       return Error("service vanished from vault");
-    }
-    Verdict v = arbiter_->Reply(nid, answer);
-    if (v.type == Verdict::Type::kQuestion) {
-      // Same negotiation id continues.
-      return AskQuestion(ctx.service, nid, v.question);
-    }
-    pending_.erase(nid);
+    Verdict v = arbiter_->Reply(c.arbiter_id, c.details);
+    if (v.type == Verdict::Type::kQuestion)
+      return Question(c, v.question);
     if (v.type == Verdict::Type::kDeny)
-      return Deny(ctx.service, v.rationale);
-    return Deliver(*s, ctx.op, v);
+      return Deny(c, v.rationale);
+    return Grant(c, *s, v);
+  }
+
+  std::string Execute(const json &req) {
+    std::string id = req.value("conversation_id", "");
+    std::string command = req.value("command_summary", "");
+    auto it = conversations_.find(id);
+    if (it == conversations_.end())
+      return Error("unknown or expired conversation id '" + id + "'");
+    Conversation &c = it->second;
+    if (Expired(c)) {
+      Conversation copy = c;
+      conversations_.erase(it);
+      return Deny(copy, "conversation expired", "execute", command);
+    }
+    if (!c.approved || c.kind != "run")
+      return Deny(c, "conversation is not approved for execute", "execute",
+                  command);
+    if (c.delivered)
+      return Deny(c, "conversation already consumed", "execute", command);
+    if (!CommandFits(c, command))
+      return Deny(c, "command does not fit the approved conversation context",
+                  "execute", command);
+    const Service *s = vault_.Find(c.service);
+    if (!s)
+      return Error("service vanished from vault");
+    c.delivered = true;
+    c.details = c.details;
+    auto st = Audit(AuditEntry{.conversation_id = c.id,
+                               .event = "execute_start",
+                               .agent = c.agent,
+                               .service = c.service,
+                               .intent = c.intent,
+                               .details = c.details,
+                               .command_summary = command,
+                               .transcript = Transcript(c),
+                               .verdict = "granted",
+                               .rationale = c.rationale,
+                               .ttl_seconds = c.ttl_seconds,
+                               .max_uses = c.max_uses,
+                               .disclosure = DisclosureName(s->disclosure)});
+    if (!st.ok())
+      return AuditError(st);
+    return DeliverCredential(c, *s);
+  }
+
+  std::string ExecuteResult(const json &req) {
+    std::string id = req.value("conversation_id", "");
+    auto it = conversations_.find(id);
+    if (it == conversations_.end())
+      return json{{"status", "ok"}}.dump();
+    Conversation c = it->second;
+    conversations_.erase(it);
+    const Service *s = vault_.Find(c.service);
+    auto st =
+        Audit(AuditEntry{.conversation_id = c.id,
+                         .event = "execute_result",
+                         .agent = c.agent,
+                         .service = c.service,
+                         .intent = c.intent,
+                         .details = c.details,
+                         .transcript = Transcript(c),
+                         .verdict = "granted",
+                         .rationale = c.rationale,
+                         .ttl_seconds = c.ttl_seconds,
+                         .max_uses = c.max_uses,
+                         .disclosure = s ? DisclosureName(s->disclosure) : "",
+                         .child_exit_code = req.value("child_exit_code", -1),
+                         .redacted = req.value("redacted", false)});
+    if (!st.ok())
+      return AuditError(st);
+    return json{{"status", "ok"}}.dump();
+  }
+
+  std::string ExposeFinal(const json &req) {
+    std::string id = req.value("conversation_id", "");
+    auto it = conversations_.find(id);
+    if (it == conversations_.end())
+      return Error("unknown or expired conversation id '" + id + "'");
+    Conversation c = it->second;
+    conversations_.erase(it);
+    if (Expired(c))
+      return Deny(c, "conversation expired", "expose_final");
+    if (!c.approved || c.kind != "expose")
+      return Deny(c, "conversation is not approved for expose", "expose_final");
+    const Service *s = vault_.Find(c.service);
+    if (!s)
+      return Error("service vanished from vault");
+    if (s->disclosure != Disclosure::kReveal)
+      return Deny(c, "service does not permit revealing its value",
+                  "expose_final");
+    auto st = Audit(AuditEntry{.conversation_id = c.id,
+                               .event = "expose_final",
+                               .agent = c.agent,
+                               .service = c.service,
+                               .intent = c.intent,
+                               .details = c.details,
+                               .transcript = Transcript(c),
+                               .verdict = "granted",
+                               .rationale = c.rationale,
+                               .ttl_seconds = c.ttl_seconds,
+                               .max_uses = c.max_uses,
+                               .disclosure = DisclosureName(s->disclosure)});
+    if (!st.ok())
+      return AuditError(st);
+    return DeliverCredential(c, *s);
   }
 
   std::string Reuse(const json &req) {
     std::string lease_id = req.value("lease_id", "");
-    last_agent_ = req.value("agent", "agent");
+    std::string agent = req.value("agent", "agent");
     std::uint32_t left = 0;
     std::string service;
-    auto st = leases_.Consume(lease_id, /*expect_service=*/"", &left, &service);
-    const char *reason = nullptr;
-    switch (st) {
-    case LeaseTable::Status::kUnknown:
-      reason = "no such lease";
-      break;
-    case LeaseTable::Status::kExpired:
-      reason = "lease expired";
-      break;
-    case LeaseTable::Status::kExhausted:
-      reason = "lease fully used";
-      break;
-    case LeaseTable::Status::kWrongService:
-      reason = "lease is for a different service";
-      break;
-    case LeaseTable::Status::kOk:
-      break;
-    }
-    if (reason) {
-      last_intent_ = "(lease reuse)";
-      last_transcript_ = "reuse lease " + lease_id;
-      return Deny(service, reason);
+    auto lease_status = leases_.Consume(lease_id, "", &left, &service);
+    if (lease_status != LeaseTable::Status::kOk) {
+      Conversation c{.id = lease_id,
+                     .kind = "run",
+                     .service = service,
+                     .agent = agent,
+                     .intent = "(lease reuse)"};
+      return Deny(c, LeaseReason(lease_status), "lease_reuse");
     }
     const Service *s = vault_.Find(service);
     if (!s)
       return Error("unknown service for lease");
-    std::string credential(reinterpret_cast<const char *>(s->credential.data()),
-                           s->credential.size());
-    auto audit_status =
-        audit_.Append(AuditEntry{.agent = last_agent_,
-                                 .service = service,
-                                 .intent = "(lease reuse)",
-                                 .transcript = "reuse lease " + lease_id,
-                                 .verdict = "granted",
-                                 .rationale = "reused existing lease",
-                                 .disclosure = DisclosureName(s->disclosure)});
-    if (!audit_status.ok()) {
-      SecureZero(credential.data(), credential.size());
-      return Error("could not append audit record: " +
-                   std::string(audit_status.message()));
-    }
-    json r{{"status", "granted"},
-           {"lease_id", lease_id},
-           {"uses_remaining", left},
-           {"rationale", "reused existing lease"},
-           {"env_var", s->env_var},
-           {"disclosure", DisclosureName(s->disclosure)},
-           {"credential", credential}};
-    std::string out = r.dump();
-    SecureZero(credential.data(), credential.size());
-    return out;
+    Conversation c{.id = lease_id,
+                   .kind = "run",
+                   .service = service,
+                   .agent = agent,
+                   .intent = "(lease reuse)",
+                   .rationale = "reused existing lease"};
+    auto st = Audit(AuditEntry{.conversation_id = c.id,
+                               .event = "lease_reuse",
+                               .agent = agent,
+                               .service = service,
+                               .intent = "(lease reuse)",
+                               .transcript = "reuse lease " + lease_id,
+                               .verdict = "granted",
+                               .rationale = "reused existing lease",
+                               .disclosure = DisclosureName(s->disclosure)});
+    if (!st.ok())
+      return AuditError(st);
+    return DeliverCredential(c, *s);
   }
 
   Vault vault_;
   std::unique_ptr<Arbiter> arbiter_;
   AuditLog audit_;
   LeaseTable leases_;
-  std::map<std::string, Pending> pending_;
-  std::string last_agent_, last_intent_, last_transcript_;
+  std::map<std::string, Conversation> conversations_;
 };
 
 } // namespace
