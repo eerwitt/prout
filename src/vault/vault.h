@@ -32,9 +32,17 @@ struct Policy {
 
 struct Service {
   std::string name;
-  std::string env_var; // e.g. GITHUB_TOKEN
+  std::string inject_env; // e.g. GITHUB_TOKEN
   Disclosure disclosure = Disclosure::kInject;
   Policy policy;
+  std::string website_url;
+  std::string website_host;
+  std::string company;
+  std::string details;
+  std::string expires_at;
+  std::string created_at;
+  std::string updated_at;
+  std::vector<std::string> update_timestamps;
   SecureBuffer credential; // decrypted secret, locked in memory
 };
 
@@ -51,9 +59,14 @@ public:
   absl::Status Save() const;
 
   // Adds or replaces a service, then persists. `credential` is consumed.
-  absl::Status AddService(const std::string &name, const std::string &env_var,
-                          Disclosure disclosure, const Policy &policy,
-                          SecureBuffer credential);
+  absl::Status AddService(Service service, SecureBuffer credential);
+
+  // Edits an existing service, then persists. If `credential` is non-null it is
+  // consumed and replaces the old credential.
+  absl::Status EditService(const std::string &name, const Service &updates,
+                           const SecureBuffer *credential);
+
+  absl::Status DeleteService(const std::string &name);
 
   std::vector<std::string> ServiceNames() const;
   const Service *Find(const std::string &name) const;

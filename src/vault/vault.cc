@@ -1,5 +1,9 @@
 #include "vault/vault.h"
 
+#include <algorithm>
+#include <chrono>
+#include <cctype>
+#include <ctime>
 #include <filesystem>
 #include <fstream>
 #include <sstream>
@@ -24,9 +28,24 @@ absl::StatusOr<Disclosure> ParseDisclosure(const std::string &s) {
 }
 
 namespace {
+constexpr int kBodySchemaVersion = 2;
 
 std::string VaultFile(const std::string &dir) {
   return (fs::path(dir) / "vault.json").string();
+}
+
+std::string NowIso8601() {
+  auto now = std::chrono::system_clock::now();
+  std::time_t t = std::chrono::system_clock::to_time_t(now);
+  std::tm tm{};
+#if defined(_WIN32)
+  gmtime_s(&tm, &t);
+#else
+  gmtime_r(&t, &tm);
+#endif
+  char buf[32];
+  std::strftime(buf, sizeof(buf), "%Y-%m-%dT%H:%M:%SZ", &tm);
+  return buf;
 }
 
 absl::StatusOr<std::string> ReadFile(const std::string &path) {
@@ -59,19 +78,43 @@ absl::Status WriteFileAtomic(const std::string &path, const std::string &data) {
   return absl::OkStatus();
 }
 
-// Serializes services (including plaintext credentials) to a JSON string that
-// the caller must wipe after encrypting.
+std::string RequiredString(const json &j, const char *field,
+                           const std::string &service) {
+  if (!j.contains(field) || !j[field].is_string())
+    throw std::runtime_error("service '" + service +
+                             "' missing required field '" + field + "'");
+  return j[field].get<std::string>();
+}
+
+std::uint32_t RequiredU32(const json &j, const char *field,
+                          const std::string &service) {
+  if (!j.contains(field) || !j[field].is_number_unsigned())
+    throw std::runtime_error("service '" + service +
+                             "' missing required field '" + field + "'");
+  return j[field].get<std::uint32_t>();
+}
+
 std::string SerializeBody(const std::map<std::string, Service> &services) {
   json body;
+  body["schema_version"] = kBodySchemaVersion;
   json svc = json::object();
   for (const auto &[name, s] : services) {
     json j;
-    j["env_var"] = s.env_var;
+    j["name"] = s.name;
+    j["inject_env"] = s.inject_env;
     j["disclosure"] = DisclosureName(s.disclosure);
     j["policy"] = {{"max_ttl_seconds", s.policy.max_ttl_seconds},
                    {"max_uses", s.policy.max_uses},
                    {"description", s.policy.description},
                    {"guidance", s.policy.guidance}};
+    j["website_url"] = s.website_url;
+    j["website_host"] = s.website_host;
+    j["company"] = s.company;
+    j["details"] = s.details;
+    j["expires_at"] = s.expires_at;
+    j["created_at"] = s.created_at;
+    j["updated_at"] = s.updated_at;
+    j["update_timestamps"] = s.update_timestamps;
     j["credential"] =
         std::string(reinterpret_cast<const char *>(s.credential.data()),
                     s.credential.size());
@@ -79,6 +122,40 @@ std::string SerializeBody(const std::map<std::string, Service> &services) {
   }
   body["services"] = std::move(svc);
   return body.dump();
+}
+
+Service CopyServiceMetadata(const Service &s) {
+  Service out;
+  out.name = s.name;
+  out.inject_env = s.inject_env;
+  out.disclosure = s.disclosure;
+  out.policy = s.policy;
+  out.website_url = s.website_url;
+  out.website_host = s.website_host;
+  out.company = s.company;
+  out.details = s.details;
+  out.expires_at = s.expires_at;
+  out.created_at = s.created_at;
+  out.updated_at = s.updated_at;
+  out.update_timestamps = s.update_timestamps;
+  return out;
+}
+absl::Status ValidateService(const Service &s) {
+  if (s.name.empty())
+    return absl::InvalidArgumentError("service name is required");
+  if (s.inject_env.empty())
+    return absl::InvalidArgumentError("--inject-env is required");
+  if (s.website_url.empty())
+    return absl::InvalidArgumentError("--website is required");
+  if (s.website_host.empty())
+    return absl::InvalidArgumentError("website host is required");
+  if (s.company.empty())
+    return absl::InvalidArgumentError("--company is required");
+  if (s.details.empty())
+    return absl::InvalidArgumentError("--details is required");
+  if (s.policy.max_ttl_seconds == 0 || s.policy.max_uses == 0)
+    return absl::InvalidArgumentError("policy ceilings must be non-zero");
+  return absl::OkStatus();
 }
 
 } // namespace
@@ -144,26 +221,52 @@ absl::StatusOr<Vault> Vault::Open(const std::string &dir,
       nullptr, false);
   if (body.is_discarded())
     return absl::DataLossError("decrypted vault body is not JSON");
+  if (body.value("schema_version", 0) != kBodySchemaVersion)
+    return absl::DataLossError(
+        "unsupported vault body schema; recreate the vault with this version");
+  if (!body.contains("services") || !body["services"].is_object())
+    return absl::DataLossError("vault body schema missing services object");
 
-  if (body.contains("services")) {
+  try {
     for (auto &[name, j] : body.at("services").items()) {
       Service s;
-      s.name = name;
-      s.env_var = j.value("env_var", "");
-      auto disc = ParseDisclosure(j.value("disclosure", "inject"));
+      s.name = RequiredString(j, "name", name);
+      if (s.name != name)
+        return absl::DataLossError("service key/name mismatch for '" + name +
+                                   "'");
+      s.inject_env = RequiredString(j, "inject_env", name);
+      auto disc = ParseDisclosure(RequiredString(j, "disclosure", name));
       if (!disc.ok())
         return disc.status();
       s.disclosure = *disc;
       const auto &p = j.at("policy");
-      s.policy.max_ttl_seconds = p.value("max_ttl_seconds", 900u);
-      s.policy.max_uses = p.value("max_uses", 3u);
-      s.policy.description = p.value("description", "");
-      s.policy.guidance = p.value("guidance", "");
-      std::string cred = j.value("credential", "");
+      s.policy.max_ttl_seconds = RequiredU32(p, "max_ttl_seconds", name);
+      s.policy.max_uses = RequiredU32(p, "max_uses", name);
+      s.policy.description = RequiredString(p, "description", name);
+      s.policy.guidance = RequiredString(p, "guidance", name);
+      s.website_url = RequiredString(j, "website_url", name);
+      s.website_host = RequiredString(j, "website_host", name);
+      s.company = RequiredString(j, "company", name);
+      s.details = RequiredString(j, "details", name);
+      s.expires_at = j.value("expires_at", "");
+      s.created_at = RequiredString(j, "created_at", name);
+      s.updated_at = RequiredString(j, "updated_at", name);
+      if (!j.contains("update_timestamps") ||
+          !j["update_timestamps"].is_array())
+        return absl::DataLossError("service '" + name +
+                                   "' missing update_timestamps");
+      for (const auto &ts : j["update_timestamps"])
+        s.update_timestamps.push_back(ts.get<std::string>());
+      std::string cred = RequiredString(j, "credential", name);
       s.credential.assign(cred);
       SecureZero(cred.data(), cred.size());
+      auto valid = ValidateService(s);
+      if (!valid.ok())
+        return valid;
       v.services_.emplace(name, std::move(s));
     }
+  } catch (const std::exception &e) {
+    return absl::DataLossError(e.what());
   }
   return v;
 }
@@ -186,17 +289,52 @@ absl::Status Vault::Save() const {
   return WriteFileAtomic(VaultFile(dir_), head.dump(2));
 }
 
-absl::Status Vault::AddService(const std::string &name,
-                               const std::string &env_var,
-                               Disclosure disclosure, const Policy &policy,
-                               SecureBuffer credential) {
-  Service s;
-  s.name = name;
-  s.env_var = env_var;
-  s.disclosure = disclosure;
-  s.policy = policy;
-  s.credential = std::move(credential);
-  services_[name] = std::move(s);
+absl::Status Vault::AddService(Service service, SecureBuffer credential) {
+  auto valid = ValidateService(service);
+  if (!valid.ok())
+    return valid;
+  std::string now = NowIso8601();
+  service.created_at = now;
+  service.updated_at = now;
+  service.update_timestamps.clear();
+  service.update_timestamps.push_back(now);
+  service.credential = std::move(credential);
+  services_[service.name] = std::move(service);
+  return Save();
+}
+
+absl::Status Vault::EditService(const std::string &name, const Service &updates,
+                                const SecureBuffer *credential) {
+  auto it = services_.find(name);
+  if (it == services_.end())
+    return absl::NotFoundError("unknown service '" + name + "'");
+  Service edited = CopyServiceMetadata(updates);
+  edited.name = name;
+  edited.created_at = it->second.created_at;
+  edited.update_timestamps = it->second.update_timestamps;
+  std::string now = NowIso8601();
+  edited.updated_at = now;
+  edited.update_timestamps.push_back(now);
+  if (credential) {
+    edited.credential.assign(reinterpret_cast<const char *>(credential->data()),
+                             credential->size());
+  } else {
+    edited.credential.assign(
+        reinterpret_cast<const char *>(it->second.credential.data()),
+        it->second.credential.size());
+  }
+  auto valid = ValidateService(edited);
+  if (!valid.ok())
+    return valid;
+  it->second = std::move(edited);
+  return Save();
+}
+
+absl::Status Vault::DeleteService(const std::string &name) {
+  auto it = services_.find(name);
+  if (it == services_.end())
+    return absl::NotFoundError("unknown service '" + name + "'");
+  services_.erase(it);
   return Save();
 }
 

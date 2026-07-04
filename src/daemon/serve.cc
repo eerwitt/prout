@@ -12,6 +12,7 @@
 #include <memory>
 #include <sstream>
 #include <string>
+#include <vector>
 
 #include "arbiter/arbiter.h"
 #include "audit/audit.h"
@@ -235,13 +236,66 @@ private:
     return !(read_only && mutating);
   }
 
+  std::vector<std::string> CommandHosts(const std::string &command) const {
+    std::vector<std::string> hosts;
+    std::string lower = Lower(command);
+    std::size_t pos = 0;
+    while (true) {
+      std::size_t http = lower.find("http://", pos);
+      std::size_t https = lower.find("https://", pos);
+      std::size_t start =
+          std::min(http == std::string::npos ? lower.size() : http,
+                   https == std::string::npos ? lower.size() : https);
+      if (start == lower.size())
+        break;
+      start += lower.compare(start, 8, "https://") == 0 ? 8 : 7;
+      std::size_t end = lower.find_first_of(" /?#'\"`)", start);
+      std::string host =
+          lower.substr(start, end == std::string::npos ? end : end - start);
+      if (!host.empty() && host.front() == '[') {
+        auto close = host.find(']');
+        if (close != std::string::npos)
+          host = host.substr(1, close - 1);
+      } else {
+        auto colon = host.find(':');
+        if (colon != std::string::npos)
+          host.erase(colon);
+      }
+      while (!host.empty() && host.back() == '.')
+        host.pop_back();
+      if (!host.empty())
+        hosts.push_back(host);
+      if (end == std::string::npos)
+        break;
+      pos = end + 1;
+    }
+    return hosts;
+  }
+
+  bool CommandTargetsServiceHost(const Service &s,
+                                 const std::string &command) const {
+    if (s.website_host.empty())
+      return true;
+    auto hosts = CommandHosts(command);
+    if (hosts.empty())
+      return true;
+    std::string allowed = Lower(s.website_host);
+    for (const auto &host : hosts) {
+      if (host != allowed && !(host.size() > allowed.size() &&
+                               host.compare(host.size() - allowed.size(),
+                                            allowed.size(), allowed) == 0 &&
+                               host[host.size() - allowed.size() - 1] == '.'))
+        return false;
+    }
+    return true;
+  }
   std::string DeliverCredential(const Conversation &c, const Service &s) {
     std::string credential(reinterpret_cast<const char *>(s.credential.data()),
                            s.credential.size());
     json r{
         {"status", "deliver"},     {"conversation_id", c.id},
         {"service", c.service},    {"kind", c.kind},
-        {"env_var", s.env_var},    {"disclosure", DisclosureName(s.disclosure)},
+        {"env_var", s.inject_env}, {"disclosure", DisclosureName(s.disclosure)},
         {"credential", credential}};
     std::string out = r.dump();
     SecureZero(credential.data(), credential.size());
@@ -326,6 +380,10 @@ private:
     const Service *s = vault_.Find(c.service);
     if (!s)
       return Error("service vanished from vault");
+    if (!CommandTargetsServiceHost(*s, command))
+      return Deny(
+          c, "command targets a different website host than the service policy",
+          "execute", command);
     c.delivered = true;
     c.details = c.details;
     auto st = Audit(AuditEntry{.conversation_id = c.id,

@@ -8,5 +8,7 @@
 namespace prout {
 
 std::string ReadPassphrase(const std::string &prompt);
+std::string ReadSecretLine(const std::string &prompt);
+void ClearSensitiveTerminalArea();
 
 } // namespace prout

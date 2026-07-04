@@ -48,17 +48,27 @@ try {
   if ($r.Code -ne 0) { Fail "vault init failed: $($r.Err)" }
 
   $env:PROUT_CREDENTIAL = 'inject-secret'
-  $r = Invoke-Prout -ArgList @('vault', 'add', 'api', '--env', 'API_TOKEN', '--disclosure', 'inject', '--max-ttl', '120', '--max-uses', '2', '--description', 'test api token', '--guidance', 'grant concrete local test intents')
+  $r = Invoke-Prout -ArgList @('vault', 'add', 'github/personal', '--inject-env', 'API_TOKEN', '--website', 'https://api.example.test/account', '--company', 'Example API', '--details', 'local integration fixture token', '--disclosure', 'inject', '--max-ttl', '120', '--max-uses', '2', '--description', 'test api token', '--guidance', 'grant concrete local test intents')
   if ($r.Code -ne 0) { Fail "vault add inject failed: $($r.Err)" }
 
   $env:PROUT_CREDENTIAL = 'reveal-secret'
-  $r = Invoke-Prout -ArgList @('vault', 'add', 'reveal', '--env', 'REVEAL_TOKEN', '--disclosure', 'reveal', '--max-ttl', '120', '--max-uses', '1', '--description', 'test reveal token')
+  $r = Invoke-Prout -ArgList @('vault', 'add', 'stripe:billing', '--inject-env', 'REVEAL_TOKEN', '--website', 'https://billing.example.test', '--company', 'Billing Example', '--details', 'reveal mode fixture token', '--disclosure', 'reveal', '--max-ttl', '120', '--max-uses', '1', '--description', 'test reveal token')
   if ($r.Code -ne 0) { Fail "vault add reveal failed: $($r.Err)" }
   $env:PROUT_CREDENTIAL = ''
 
   $r = Invoke-Prout -ArgList @('vault', 'list')
   if ($r.Code -ne 0) { Fail "vault list failed: $($r.Err)" }
   if (($r.Out + $r.Err).Contains('inject-secret') -or ($r.Out + $r.Err).Contains('reveal-secret')) { Fail 'vault list leaked a credential' }
+
+  $r = Invoke-Prout -ArgList @('vault', 'edit', 'github/personal', '--company', 'Example API Edited', '--details', 'edited local integration fixture token')
+  if ($r.Code -ne 0) { Fail "vault edit failed: $($r.Err)" }
+
+  $env:PROUT_CREDENTIAL = 'delete-secret'
+  $r = Invoke-Prout -ArgList @('vault', 'add', 'aws:prod/admin', '--inject-env', 'DELETE_TOKEN', '--website', 'https://delete.example.test', '--company', 'Delete Example', '--details', 'temporary delete fixture', '--description', 'delete fixture')
+  if ($r.Code -ne 0) { Fail "vault add delete fixture failed: $($r.Err)" }
+  $env:PROUT_CREDENTIAL = ''
+  $r = Invoke-Prout -ArgList @('vault', 'delete', 'aws:prod/admin')
+  if ($r.Code -ne 0) { Fail "vault delete failed: $($r.Err)" }
 
   $daemonPsi = [System.Diagnostics.ProcessStartInfo]::new()
   $daemonPsi.FileName = $ProutExe
@@ -81,7 +91,7 @@ try {
   if ($r.Code -eq 0) { Fail 'second daemon unexpectedly bound live socket' }
 
   $child = "if (`$env:API_TOKEN -ne 'inject-secret') { exit 3 }; Write-Output `$env:API_TOKEN; exit 0"
-  $r = Invoke-Prout -ArgList @('run', '--service', 'api', '--intent', 'update the local integration fixture with the configured token')
+  $r = Invoke-Prout -ArgList @('run', '--service', 'github/personal', '--intent', 'update the local integration fixture with the configured token')
   if ($r.Code -ne 0) { Fail "run negotiation failed: rc=$($r.Code) out=$($r.Out) err=$($r.Err)" }
   if (($r.Out + $r.Err).Contains('inject-secret')) { Fail 'run negotiation leaked injected credential' }
   $grant = $r.Out | ConvertFrom-Json
@@ -96,15 +106,21 @@ try {
   if (($r.Out + $r.Err).Contains('inject-secret')) { Fail 'execute output leaked injected credential' }
   if (-not $r.Out.Contains('*************')) { Fail "execute did not redact leaked credential bytes: out=$($r.Out)" }
 
+  $r = Invoke-Prout -ArgList @('run', '--service', 'github/personal', '--intent', 'update the local integration fixture with the configured token')
+  if ($r.Code -ne 0) { Fail "domain mismatch negotiation failed: rc=$($r.Code) out=$($r.Out) err=$($r.Err)" }
+  $badGrant = $r.Out | ConvertFrom-Json
+  $r = Invoke-Prout -ArgList @('execute', '--conversation', $badGrant.conversation_id, '--', 'powershell', '-NoProfile', '-Command', 'Invoke-WebRequest https://evil.example.test')
+  if ($r.Code -ne 11) { Fail "domain mismatch was not denied: rc=$($r.Code) out=$($r.Out) err=$($r.Err)" }
+
   $r = Invoke-Prout -ArgList @('execute', '--conversation', $cid, '--', 'powershell', '-NoProfile', '-Command', 'exit 0')
   if ($r.Code -ne 11 -and $r.Code -ne 1) { Fail "reused execute conversation was not rejected: rc=$($r.Code) out=$($r.Out) err=$($r.Err)" }
 
   $r = Invoke-Prout -ArgList @('run', '--lease', $lease, '--', 'powershell', '-NoProfile', '-Command', "if (`$env:API_TOKEN -eq 'inject-secret') { exit 0 } else { exit 3 }")
   if ($r.Code -ne 0) { Fail "lease reuse failed without service: rc=$($r.Code) out=$($r.Out) err=$($r.Err)" }
 
-  $r = Invoke-Prout -ArgList @('expose', '--service', 'api', '--intent', 'read token for debugging')
+  $r = Invoke-Prout -ArgList @('expose', '--service', 'github/personal', '--intent', 'read token for debugging')
   if ($r.Code -ne 11) { Fail "inject-only service was revealable: rc=$($r.Code) out=$($r.Out) err=$($r.Err)" }
-  $r = Invoke-Prout -ArgList @('expose', '--service', 'reveal', '--intent', 'read token for a one time shell export')
+  $r = Invoke-Prout -ArgList @('expose', '--service', 'stripe:billing', '--intent', 'read token for a one time shell export')
   if ($r.Code -ne 0) { Fail "reveal expose negotiation failed: rc=$($r.Code) out=$($r.Out) err=$($r.Err)" }
   if (($r.Out + $r.Err).Contains('reveal-secret')) { Fail 'reveal expose negotiation leaked credential' }
   $revealGrant = $r.Out | ConvertFrom-Json
@@ -115,7 +131,7 @@ try {
   if (-not $r.Out.Contains('reveal-secret')) { Fail 'final expose did not return credential' }
 
   $shouldNotRun = Join-Path $root 'should-not-run.txt'
-  $r = Invoke-Prout -ArgList @('run', '--service', 'api', '--intent', 'fix')
+  $r = Invoke-Prout -ArgList @('run', '--service', 'github/personal', '--intent', 'fix')
   if ($r.Code -ne 10) { Fail "vague intent did not return question exit 10: rc=$($r.Code) out=$($r.Out) err=$($r.Err)" }
   if (Test-Path $shouldNotRun) { Fail 'child command ran despite question response' }
   $question = $r.Out | ConvertFrom-Json
