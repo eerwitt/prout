@@ -4,6 +4,7 @@
 #include <atomic>
 #include <cctype>
 #include <cstdint>
+#include <cstdio>
 #include <functional>
 #include <map>
 #include <memory>
@@ -90,27 +91,56 @@ std::string ExtractAssistantText(const std::string &dump) {
 std::string BuildSystemPrompt(const Service &s) {
   const Policy &p = s.policy;
   std::ostringstream o;
-  o << "You are Prout, an on-device credential-lease arbiter. An AI agent "
-       "wants "
-       "to use a stored credential. Your job is to grant a SHORT-LIVED lease "
-       "with a sensible time-to-live and use-count based on WHY the agent says "
-       "it needs the credential. Granting is the normal outcome; only deny if "
-       "the stated intent is contradictory, clearly abusive, or makes no sense "
-       "for this credential.\n\n";
-  o << "CREDENTIAL: " << (p.description.empty() ? s.name : p.description)
-    << "\n";
-  o << "POLICY CEILINGS (you cannot exceed these; the system clamps you): "
-    << "max_ttl_seconds=" << p.max_ttl_seconds << ", max_uses=" << p.max_uses
-    << "\n";
+  o << "You are Prout's local credential-lease arbiter. You are NOT being "
+       "asked to use, validate, reveal, inspect, or receive the credential. "
+       "Another process will do the requested task later if Prout grants a "
+       "lease. Your only job is to decide whether the agent's stated intent "
+       "deserves a short-lived credential lease under the owner policy.\n\n";
+  o << "Stored credential description: "
+    << (p.description.empty() ? s.name : p.description) << "\n";
+  o << "Policy ceilings (code clamps these): max_ttl_seconds="
+    << p.max_ttl_seconds << ", max_uses=" << p.max_uses << "\n";
   if (!p.guidance.empty())
-    o << "OWNER GUIDANCE: " << p.guidance << "\n";
-  o << "\nRespond with EXACTLY ONE JSON object and nothing else. One of:\n"
+    o << "Owner guidance: " << p.guidance << "\n";
+  o << "\nDo not ask for the credential value. Do not deny merely because you "
+       "cannot access websites or APIs; the requester, not you, will perform "
+       "the external action. Granting is the normal outcome for a concrete, "
+       "benign, service-relevant intent. Deny only if the intent is abusive, "
+       "contradictory, impossible for this credential, or nonsensical. Ask a "
+       "question only if the intent is too vague to size a lease. A request "
+       "to validate/check a stored token against its own service is normally a "
+       "read-only diagnostic intent; if the exact endpoint or command is "
+       "unclear, ask for those details instead of denying.\n\n"
+       "Call exactly one registered tool: grant_lease, ask_question, or "
+       "deny_request. Put the complete rationale in the tool arguments. If "
+       "tool calling is unavailable, respond with EXACTLY ONE JSON object and "
+       "nothing else using one of these shapes:\n"
        "  {\"type\":\"lease\",\"ttl_seconds\":<int>,\"max_uses\":<int>,"
        "\"rationale\":\"<one sentence>\"}\n"
        "  {\"type\":\"question\",\"question\":\"<one short question>\"}\n"
        "  {\"type\":\"deny\",\"rationale\":\"<one sentence>\"}\n"
-       "Ask a question only if the intent is too vague to size a lease. Prefer "
-       "the smallest ttl and use-count that fit the task.";
+       "Prefer the smallest ttl and use-count that fit the task.";
+  return o.str();
+}
+
+std::string InitialUserText(const Service &s, const std::string &agent,
+                            const std::string &intent) {
+  std::ostringstream o;
+  o << "Lease request metadata:\n";
+  o << "agent=" << agent << "\n";
+  o << "service=" << s.name << "\n";
+  if (!s.website_host.empty())
+    o << "service_host=" << s.website_host << "\n";
+  if (!s.website_url.empty())
+    o << "service_url=" << s.website_url << "\n";
+  if (!s.company.empty())
+    o << "company=" << s.company << "\n";
+  if (!s.inject_env.empty())
+    o << "delivery_env_var=" << s.inject_env << "\n";
+  o << "disclosure=" << DisclosureName(s.disclosure) << "\n";
+  o << "intent=" << intent << "\n\n";
+  o << "Decide whether this intent should receive a credential lease. Do not "
+       "perform the task and do not ask for the credential value.";
   return o.str();
 }
 
@@ -120,11 +150,249 @@ std::string UserMessageJson(const std::string &text) {
   return m.dump();
 }
 
+std::string ArbiterToolsJson() {
+  json string_schema = {{"type", "string"}, {"maxLength", 240}};
+  json int_schema = {{"type", "integer"}, {"minimum", 1}};
+
+  json grant_params = {
+      {"type", "object"},
+      {"properties",
+       {{"ttl_seconds", int_schema},
+        {"max_uses", int_schema},
+        {"rationale", string_schema}}},
+      {"required", json::array({"ttl_seconds", "max_uses", "rationale"})}};
+  json question_params = {
+      {"type", "object"},
+      {"properties",
+       {{"question", string_schema}, {"rationale", string_schema}}},
+      {"required", json::array({"question"})}};
+  json deny_params = {{"type", "object"},
+                      {"properties", {{"rationale", string_schema}}},
+                      {"required", json::array({"rationale"})}};
+
+  json grant = {
+      {"type", "function"},
+      {"function",
+       {{"name", "grant_lease"},
+        {"description",
+         "Grant a short-lived credential lease for a concrete benign intent."},
+        {"parameters", grant_params}}}};
+  json question = {
+      {"type", "function"},
+      {"function",
+       {{"name", "ask_question"},
+        {"description",
+         "Ask one concise follow-up question when the intent is too vague."},
+        {"parameters", question_params}}}};
+  json deny = {
+      {"type", "function"},
+      {"function",
+       {{"name", "deny_request"},
+        {"description", "Deny only when the requested credential use is "
+                        "unsafe, impossible, contradictory, or nonsensical."},
+        {"parameters", deny_params}}}};
+  return json::array({grant, question, deny}).dump();
+}
+std::string JsonStringValue(const json &j, const char *key,
+                            const std::string &fallback = std::string()) {
+  if (!j.is_object() || !j.contains(key))
+    return fallback;
+  const json &v = j[key];
+  if (v.is_string())
+    return v.get<std::string>();
+  return fallback;
+}
+
+bool JsonUintValue(const json &j, const char *key, std::uint32_t *out) {
+  if (!j.is_object() || !j.contains(key))
+    return false;
+  const json &v = j[key];
+  if (v.is_number_unsigned()) {
+    *out = v.get<std::uint32_t>();
+    return *out > 0;
+  }
+  if (v.is_number_integer()) {
+    auto i = v.get<std::int64_t>();
+    if (i <= 0)
+      return false;
+    *out = static_cast<std::uint32_t>(i);
+    return true;
+  }
+  return false;
+}
+
+bool FindToolCalls(const json &node, const json **calls) {
+  if (node.is_object()) {
+    auto it = node.find("tool_calls");
+    if (it != node.end() && it->is_array()) {
+      *calls = &*it;
+      return true;
+    }
+    for (const auto &[_, v] : node.items()) {
+      if (FindToolCalls(v, calls))
+        return true;
+    }
+  } else if (node.is_array()) {
+    for (const auto &v : node) {
+      if (FindToolCalls(v, calls))
+        return true;
+    }
+  }
+  return false;
+}
+
+json ToolArguments(const json &function) {
+  if (!function.is_object() || !function.contains("arguments"))
+    return json::object();
+  const json &args = function["arguments"];
+  if (args.is_object())
+    return args;
+  if (args.is_string()) {
+    json parsed = json::parse(args.get<std::string>(), nullptr, false);
+    if (parsed.is_object())
+      return parsed;
+  }
+  return json::object();
+}
+
+std::string CompactRationale(const std::string &text) {
+  std::string out;
+  out.reserve(std::min<std::size_t>(text.size(), 240));
+  bool last_space = true;
+  int sentences = 0;
+  for (char c : text) {
+    unsigned char uc = static_cast<unsigned char>(c);
+    if (std::isspace(uc)) {
+      if (!last_space) {
+        out.push_back(' ');
+        last_space = true;
+      }
+      continue;
+    }
+    out.push_back(c);
+    last_space = false;
+    if (c == '.' || c == '!' || c == '?') {
+      ++sentences;
+      if (sentences >= 2)
+        break;
+    }
+    if (out.size() >= 240) {
+      out.resize(237);
+      out += "...";
+      break;
+    }
+  }
+  while (!out.empty() && out.back() == ' ')
+    out.pop_back();
+  return out.empty() ? "denied by arbiter" : out;
+}
+
+Verdict ProposeToolCallVerdict(const std::string &raw, const Policy &policy,
+                               bool *found_tool_call) {
+  *found_tool_call = false;
+  json root = json::parse(raw, nullptr, false);
+  if (root.is_discarded())
+    return Verdict::Deny("arbiter response was not valid JSON");
+  const json *calls = nullptr;
+  if (!FindToolCalls(root, &calls))
+    return Verdict::Deny("arbiter returned no tool call");
+  *found_tool_call = true;
+  if (calls->empty())
+    return Verdict::Deny("arbiter returned empty tool call list");
+
+  const json &tool = calls->front();
+  if (!tool.is_object() || !tool.contains("function") ||
+      !tool["function"].is_object())
+    return Verdict::Deny("arbiter tool call was malformed");
+  const json &function = tool["function"];
+  std::string name = JsonStringValue(function, "name");
+  json args = ToolArguments(function);
+
+  if (name == "ask_question") {
+    std::string q = JsonStringValue(args, "question");
+    if (q.empty())
+      return Verdict::Deny("arbiter question tool call omitted question");
+    return Verdict::Question(q);
+  }
+  if (name == "deny_request") {
+    std::string rationale =
+        JsonStringValue(args, "rationale", "denied by arbiter");
+    return Verdict::Deny(CompactRationale(rationale));
+  }
+  if (name == "grant_lease") {
+    std::uint32_t ttl = 0;
+    std::uint32_t uses = 0;
+    if (!JsonUintValue(args, "ttl_seconds", &ttl))
+      ttl = policy.max_ttl_seconds;
+    if (!JsonUintValue(args, "max_uses", &uses))
+      uses = 1;
+    ttl = Clamp(ttl, 1u, policy.max_ttl_seconds);
+    uses = Clamp(uses, 1u, policy.max_uses);
+    std::string rationale =
+        JsonStringValue(args, "rationale", "intent accepted");
+    return Verdict::Lease(ttl, uses, CompactRationale(rationale));
+  }
+  return Verdict::Deny("arbiter called unknown tool '" + name + "'");
+}
+bool IsParseFailure(const Verdict &v) {
+  return v.type == Verdict::Type::kDeny &&
+         (v.rationale == "arbiter returned no parseable verdict" ||
+          v.rationale == "arbiter verdict was not valid JSON" ||
+          v.rationale == "arbiter verdict had unknown type");
+}
+
+std::string LogSnippet(const std::string &text) {
+  constexpr std::size_t kMaxSnippet = 800;
+  std::string out;
+  std::size_t n = std::min(text.size(), kMaxSnippet);
+  out.reserve(n);
+  for (std::size_t i = 0; i < n; ++i) {
+    char c = text[i];
+    if (c == '\n')
+      out += "\\n";
+    else if (c == '\r')
+      out += "\\r";
+    else if (c == '\t')
+      out += "\\t";
+    else
+      out += c;
+  }
+  if (text.size() > kMaxSnippet)
+    out += "...";
+  return out;
+}
+
+void LogParseFailure(const char *phase, const Verdict &v,
+                     const std::string &text) {
+  std::string snippet = LogSnippet(text);
+  std::fprintf(stderr, "prout: arbiter %s parse failed: %s; model_text=%s\n",
+               phase, v.rationale.c_str(), snippet.c_str());
+}
+
+std::string RepairPrompt() {
+  return "Your previous answer was not valid for Prout. Call exactly one "
+         "registered tool: grant_lease, ask_question, or deny_request. If tool "
+         "calling is unavailable, return exactly one JSON object and no prose, "
+         "markdown, code fence, or explanation. You are deciding a credential "
+         "lease only; do not deny because you cannot access websites or APIs, "
+         "and do not ask for the credential value. Use one of these JSON "
+         "fallback shapes: "
+         "{\"type\":\"lease\",\"ttl_seconds\":300,\"max_uses\":1,"
+         "\"rationale\":\"one sentence\"} or "
+         "{\"type\":\"question\",\"question\":\"one short question\"} "
+         "or {\"type\":\"deny\",\"rationale\":\"one sentence\"}.";
+}
+
 } // namespace
 
 Verdict ProposeVerdict(const std::string &raw, const Policy &policy) {
   if (policy.max_ttl_seconds == 0 || policy.max_uses == 0)
     return Verdict::Deny("service policy has zero lease ceiling");
+
+  bool found_tool_call = false;
+  Verdict tool = ProposeToolCallVerdict(raw, policy, &found_tool_call);
+  if (found_tool_call)
+    return tool;
 
   std::string obj = FirstJsonObject(raw);
   if (obj.empty())
@@ -184,7 +452,7 @@ public:
       litert_lm_engine_delete(engine_);
   }
 
-  Verdict Begin(const Service &s, const std::string & /*agent*/,
+  Verdict Begin(const Service &s, const std::string &agent,
                 const std::string &intent, std::string *nid) override {
     std::string id = NewId();
     Neg n;
@@ -193,7 +461,7 @@ public:
     if (!n.conv)
       return Verdict::Deny("arbiter failed to start a conversation");
     negotiations_.emplace(id, std::move(n));
-    return Advance(id, intent, nid);
+    return Advance(id, InitialUserText(s, agent, intent), nid);
   }
 
   Verdict Reply(const std::string &nid, const std::string &answer) override {
@@ -223,6 +491,9 @@ private:
     litert_lm_session_config_set_max_output_tokens(sess, 256);
     LiteRtLmConversationConfig *cfg = litert_lm_conversation_config_create();
     litert_lm_conversation_config_set_session_config(cfg, sess);
+    litert_lm_conversation_config_set_enable_constrained_decoding(cfg, true);
+    std::string tools = ArbiterToolsJson();
+    litert_lm_conversation_config_set_tools(cfg, tools.c_str());
     std::string sys = json({{"type", "text"}, {"text", system_prompt}}).dump();
     litert_lm_conversation_config_set_system_message(cfg, sys.c_str());
     LiteRtLmConversation *conv = litert_lm_conversation_create(engine_, cfg);
@@ -245,9 +516,30 @@ private:
     Verdict v = Verdict::Deny("arbiter produced no response");
     if (resp) {
       const char *s = litert_lm_json_response_get_string(resp);
-      std::string text = s ? ExtractAssistantText(s) : std::string();
+      std::string raw = s ? std::string(s) : std::string();
+      std::string text = ExtractAssistantText(raw);
       litert_lm_json_response_delete(resp);
-      v = ProposeVerdict(text, n.policy);
+      v = ProposeVerdict(raw, n.policy);
+      if (IsParseFailure(v))
+        v = ProposeVerdict(text, n.policy);
+      if (IsParseFailure(v)) {
+        LogParseFailure("response", v, text);
+        std::string repair = UserMessageJson(RepairPrompt());
+        LiteRtLmJsonResponse *retry = litert_lm_conversation_send_message(
+            n.conv, repair.c_str(), /*extra_context=*/nullptr,
+            /*optional_args=*/nullptr);
+        if (retry) {
+          const char *rs = litert_lm_json_response_get_string(retry);
+          std::string repaired_raw = rs ? std::string(rs) : std::string();
+          std::string repaired_text = ExtractAssistantText(repaired_raw);
+          litert_lm_json_response_delete(retry);
+          v = ProposeVerdict(repaired_raw, n.policy);
+          if (IsParseFailure(v))
+            v = ProposeVerdict(repaired_text, n.policy);
+          if (IsParseFailure(v))
+            LogParseFailure("repair", v, repaired_text);
+        }
+      }
     }
 
     if (v.type == Verdict::Type::kQuestion && ++n.questions <= kMaxQuestions) {

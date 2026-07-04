@@ -13,18 +13,23 @@ void Usage() {
       "commands:\n"
       "  serve [--model <path>] [--backend cpu|gpu] [--vault <dir>]\n"
       "  vault init|add|list ...\n"
-      "  run --service <name> --intent <text> [--agent <name>]\n"
+      "  run --service <name> --intent <text> [--agent <name>] -- <cmd...>\n"
       "  run --conversation <id> --details <text> [--agent <name>]\n"
-      "  run --lease <id> [--agent <name>] -- <cmd...>\n"
       "  expose --service <name> --intent <text> [--agent <name>]\n"
       "  expose --conversation <id> [--details <text>] [--agent <name>]\n"
-      "  execute --conversation <id> -- <cmd...>\n"
+      "  expose --lease <id>\n"
+      "  execute --lease <id>\n"
       "  audit tail|verify|conversation [--vault <dir>]\n\n"
       "inject flow:\n"
-      "  prout run --service <name> --intent \"<why>\" [--agent <name>]\n"
-      "  prout execute --conversation <approved-id> -- <cmd...>\n"
+      "  prout run --service <name> --intent \"<why>\" [--agent <name>] -- "
+      "<cmd...>\n"
+      "  prout execute --lease <approved-lease-id>\n"
       "  # if run returns status=question, answer with:\n"
-      "  prout run --conversation <id> --details \"<answer>\" [--agent <name>]\n");
+      "  prout run --conversation <id> --details \"<answer>\" [--agent "
+      "<name>]\n\n"
+      "reveal flow:\n"
+      "  prout expose --service <name> --intent \"<why>\" [--agent <name>]\n"
+      "  prout expose --lease <approved-lease-id>\n");
 }
 
 std::vector<std::string> TailArgs(int argc, char **argv) {

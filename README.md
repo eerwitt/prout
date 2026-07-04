@@ -4,8 +4,8 @@ Prout is a local credential-lease daemon for AI agents and automation. An agent 
 
 Credentials are stored in an encrypted vault. The daemon decrypts them into locked memory after unlock and serves local CLI requests over an AF_UNIX socket using length-prefixed JSON frames. Credentials may be disclosed only through active leases, in one of two policy modes:
 
-- `inject`: `prout run` negotiates approval, then `prout execute` receives the credential from the daemon and injects it into the child process environment. The CLI redacts the credential if the child prints it.
-- `reveal`: `prout expose` negotiates approval, then final `prout expose --conversation <id>` prints the value for explicit capture.
+- `inject`: `prout run` negotiates approval and stores the command to execute, then `prout execute --lease <id>` receives the credential from the daemon and injects it into the child process environment for that stored command. The CLI redacts the credential if the child prints it.
+- `reveal`: `prout expose` negotiates approval, then final `prout expose --lease <id>` consumes the approved lease and prints the value for explicit capture.
 
 The model recommends; code enforces. Unknown services, malformed arbiter output, unknown verdicts, zero ceilings, bad disclosure modes, and requests exceeding policy ceilings are denied or rejected before credential release.
 
@@ -18,14 +18,13 @@ prout vault list
 
 prout serve [--model <path>] [--backend cpu|gpu] [--vault <dir>]
 
-prout run --service <service> --intent "<why>" [--agent <name>]
+prout run --service <service> --intent "<why>" [--agent <name>] -- <cmd...>
 prout run --conversation <id> --details "<answer>" [--agent <name>]
-prout execute --conversation <approved-id> -- <cmd...>
-prout run --lease <lease-id> [--agent <name>] -- <cmd...>
+prout execute --lease <approved-lease-id>
 
 prout expose --service <service> --intent "<why>" [--agent <name>]
 prout expose --conversation <id> --details "<answer>" [--agent <name>]
-prout expose --conversation <approved-id>
+prout expose --lease <approved-lease-id>
 
 prout audit tail [--n <count>]
 prout audit conversation <conversation-id>
@@ -44,22 +43,22 @@ Use one terminal for the daemon:
 .\dist\prout.exe serve --model C:\Users\eerwi\models\gemma-4-E2B-it-litert-lm\gemma-4-E2B-it.litertlm --backend cpu
 ```
 
-Use another terminal to negotiate a credential lease. `run` does not execute the website/API check; it returns safe JSON metadata and, when approved, a `conversation_id` for the next command.
+Use another terminal to negotiate a credential lease. The first `run` call for a run conversation must include the command after `--`. `run` stores that command with the conversation, but does not execute it; it returns safe JSON metadata and, when approved, a `lease_id` for execution.
 
 ```powershell
-.\dist\prout.exe run --service ml.huggingface --intent "checking the token is valid against the website" --agent local
+.\dist\prout.exe run --service ml.huggingface --intent "checking the token is valid against the website" --agent local -- powershell -NoProfile -Command '$h=@{Authorization=("Bearer " + $env:HF_TOKEN)}; Invoke-RestMethod -Headers $h -Uri https://huggingface.co/api/whoami-v2'
 ```
 
-If the response has `"status":"question"`, answer with the returned conversation id:
+If the response has `"status":"question"`, answer with the returned conversation id. The original command remains stored with that conversation unless the request is denied or the conversation times out:
 
 ```powershell
 .\dist\prout.exe run --conversation <question-conversation-id> --details "Validate the Hugging Face token with the whoami API once, without changing account state." --agent local
 ```
 
-When the response has `"status":"granted"`, pass its `conversation_id` to `execute`. The daemon injects the credential into the environment variable configured by `vault add --env`; this example assumes the service was added with `--env HF_TOKEN`.
+When the response has `"status":"granted"`, pass its `lease_id` to `execute`. For inject services, the grant response also includes `"env_var":"HF_TOKEN"` or the configured variable name, so callers can see which child-process environment variable will receive the credential. This example assumes the service was added with `--env HF_TOKEN`.
 
 ```powershell
-.\dist\prout.exe execute --conversation <approved-conversation-id> -- powershell -NoProfile -Command '$h=@{Authorization=("Bearer " + $env:HF_TOKEN)}; Invoke-RestMethod -Headers $h -Uri https://huggingface.co/api/whoami-v2'
+.\dist\prout.exe execute --lease <approved-lease-id>
 ```
 
 ## Arbiter Schema

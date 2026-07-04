@@ -33,6 +33,8 @@ namespace fs = std::filesystem;
 namespace {
 
 constexpr std::uint32_t kMaxFrame = 8u * 1024 * 1024;
+constexpr int kDefaultSocketTimeoutMs = 3000;
+constexpr int kClientResponseTimeoutMs = 120000;
 
 enum class FrameReadResult { kOk, kClosed, kOversized };
 
@@ -52,18 +54,26 @@ void EnsureWinsock() {
 #endif
 }
 
-void SetSocketTimeouts(socket_t s) {
+void SetSocketTimeouts(socket_t s, int recv_ms = kDefaultSocketTimeoutMs,
+                       int send_ms = kDefaultSocketTimeoutMs) {
 #if defined(_WIN32)
-  DWORD ms = 3000;
-  ::setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char *>(&ms),
-               sizeof(ms));
-  ::setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, reinterpret_cast<const char *>(&ms),
-               sizeof(ms));
+  DWORD recv_timeout = static_cast<DWORD>(recv_ms);
+  DWORD send_timeout = static_cast<DWORD>(send_ms);
+  ::setsockopt(s, SOL_SOCKET, SO_RCVTIMEO,
+               reinterpret_cast<const char *>(&recv_timeout),
+               sizeof(recv_timeout));
+  ::setsockopt(s, SOL_SOCKET, SO_SNDTIMEO,
+               reinterpret_cast<const char *>(&send_timeout),
+               sizeof(send_timeout));
 #else
-  timeval tv{};
-  tv.tv_sec = 3;
-  ::setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-  ::setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+  timeval recv_timeout{};
+  recv_timeout.tv_sec = recv_ms / 1000;
+  recv_timeout.tv_usec = (recv_ms % 1000) * 1000;
+  timeval send_timeout{};
+  send_timeout.tv_sec = send_ms / 1000;
+  send_timeout.tv_usec = (send_ms % 1000) * 1000;
+  ::setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, &recv_timeout, sizeof(recv_timeout));
+  ::setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, &send_timeout, sizeof(send_timeout));
 #endif
 }
 
@@ -274,7 +284,7 @@ absl::StatusOr<std::string> IpcRequest(const std::string &socket_path,
   socket_t s = ::socket(AF_UNIX, SOCK_STREAM, 0);
   if (s == kBadSock)
     return absl::InternalError("socket(): " + SockErr());
-  SetSocketTimeouts(s);
+  SetSocketTimeouts(s, kClientResponseTimeoutMs);
 
   sockaddr_un addr;
   if (!FillAddr(&addr, socket_path)) {
@@ -334,7 +344,8 @@ absl::Status IpcServer::Listen(const std::string &socket_path) {
     CloseSock(s);
     return absl::InvalidArgumentError("socket path too long");
   }
-  bool bound = ::bind(s, reinterpret_cast<sockaddr *>(&addr), sizeof(addr)) == 0;
+  bool bound =
+      ::bind(s, reinterpret_cast<sockaddr *>(&addr), sizeof(addr)) == 0;
 #if defined(_WIN32)
   int bind_error = bound ? 0 : WSAGetLastError();
   if (!bound && bind_error == WSAEADDRINUSE) {

@@ -214,9 +214,11 @@ int SpawnChildFiltered(const std::vector<std::string> &command,
 #endif
 }
 
-int ExecuteDelivery(const json &r, const std::vector<std::string> &command) {
+int ExecuteDelivery(const json &r) {
   std::string env_var = r.value("env_var", "");
   std::string conversation_id = r.value("conversation_id", "");
+  std::vector<std::string> command =
+      r.value("command", std::vector<std::string>{});
   SecureBuffer cred;
   {
     std::string c = r.value("credential", "");
@@ -239,23 +241,8 @@ int ExecuteDelivery(const json &r, const std::vector<std::string> &command) {
 int CmdRun(const std::vector<std::string> &argv) {
   Args a = ParseArgs(argv);
   if (a.Has("lease")) {
-    if (a.command.empty()) {
-      std::fprintf(stderr,
-                   "prout: run --lease requires a command after `--`\n");
-      return kExitError;
-    }
-    json req = {{"op", "reuse"},
-                {"lease_id", a.Get("lease")},
-                {"agent", a.Get("agent", "agent")}};
-    auto r = Send(req);
-    if (!r.ok()) {
-      std::fprintf(stderr, "prout: %s\n",
-                   std::string(r.status().message()).c_str());
-      return kExitError;
-    }
-    if (r->value("status", "") != "deliver")
-      return ReportMetadata(*r);
-    return ExecuteDelivery(*r, a.command);
+    std::fprintf(stderr, "usage: prout execute --lease <id>\n");
+    return kExitError;
   }
 
   if (a.Has("conversation")) {
@@ -272,24 +259,29 @@ int CmdRun(const std::vector<std::string> &argv) {
   }
 
   std::string service = a.Get("service");
-  if (service.empty() || !a.Has("intent")) {
-    std::fprintf(
-        stderr,
-        "usage: prout run --service <s> --intent \"<why>\" [--agent <name>]\n");
+  if (service.empty() || !a.Has("intent") || a.command.empty()) {
+    std::fprintf(stderr, "usage: prout run --service <s> --intent \"<why>\" "
+                         "[--agent <name>] -- <cmd...>\n");
     return kExitError;
   }
   return DispatchMetadata({{"op", "negotiate"},
                            {"kind", "run"},
                            {"service", service},
                            {"intent", a.Get("intent")},
-                           {"agent", a.Get("agent", "agent")}});
+                           {"agent", a.Get("agent", "agent")},
+                           {"command", a.command},
+                           {"command_summary", JoinCommand(a.command)}});
 }
 
 int CmdExpose(const std::vector<std::string> &argv) {
   Args a = ParseArgs(argv);
-  if (a.Has("conversation") && !a.Has("details")) {
+  if (a.Has("lease")) {
+    if (a.Has("details") || a.Has("conversation")) {
+      std::fprintf(stderr, "usage: prout expose --lease <id>\n");
+      return kExitError;
+    }
     auto r = Send({{"op", "expose_final"},
-                   {"conversation_id", a.Get("conversation")},
+                   {"lease_id", a.Get("lease")},
                    {"agent", a.Get("agent", "agent")}});
     if (!r.ok()) {
       std::fprintf(stderr, "prout: %s\n",
@@ -308,6 +300,10 @@ int CmdExpose(const std::vector<std::string> &argv) {
     std::fputc('\n', stdout);
     cred.clear();
     return kExitOk;
+  }
+  if (a.Has("conversation") && !a.Has("details")) {
+    std::fprintf(stderr, "usage: prout expose --lease <id>\n");
+    return kExitError;
   }
   if (a.Has("conversation")) {
     return DispatchMetadata({{"op", "continue"},
@@ -331,14 +327,11 @@ int CmdExpose(const std::vector<std::string> &argv) {
 
 int CmdExecute(const std::vector<std::string> &argv) {
   Args a = ParseArgs(argv);
-  if (!a.Has("conversation") || a.command.empty()) {
-    std::fprintf(stderr,
-                 "usage: prout execute --conversation <id> -- <cmd...>\n");
+  if (!a.Has("lease") || !a.command.empty()) {
+    std::fprintf(stderr, "usage: prout execute --lease <id>\n");
     return kExitError;
   }
-  auto r = Send({{"op", "execute"},
-                 {"conversation_id", a.Get("conversation")},
-                 {"command_summary", JoinCommand(a.command)}});
+  auto r = Send({{"op", "execute"}, {"lease_id", a.Get("lease")}});
   if (!r.ok()) {
     std::fprintf(stderr, "prout: %s\n",
                  std::string(r.status().message()).c_str());
@@ -346,7 +339,7 @@ int CmdExecute(const std::vector<std::string> &argv) {
   }
   if (r->value("status", "") != "deliver")
     return ReportMetadata(*r);
-  return ExecuteDelivery(*r, a.command);
+  return ExecuteDelivery(*r);
 }
 
 } // namespace prout

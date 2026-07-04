@@ -91,7 +91,7 @@ try {
   if ($r.Code -eq 0) { Fail 'second daemon unexpectedly bound live socket' }
 
   $child = "if (`$env:API_TOKEN -ne 'inject-secret') { exit 3 }; Write-Output `$env:API_TOKEN; exit 0"
-  $r = Invoke-Prout -ArgList @('run', '--service', 'github/personal', '--intent', 'update the local integration fixture with the configured token')
+  $r = Invoke-Prout -ArgList @('run', '--service', 'github/personal', '--intent', 'update the local integration fixture with the configured token', '--', 'powershell', '-NoProfile', '-Command', $child)
   if ($r.Code -ne 0) { Fail "run negotiation failed: rc=$($r.Code) out=$($r.Out) err=$($r.Err)" }
   if (($r.Out + $r.Err).Contains('inject-secret')) { Fail 'run negotiation leaked injected credential' }
   $grant = $r.Out | ConvertFrom-Json
@@ -99,24 +99,28 @@ try {
   if (-not $cid) { Fail "could not parse approved conversation id from run: $($r.Out)" }
   if ($cid -eq 'conv-1') { Fail 'conversation id remained sequential/predictable' }
   $lease = $grant.lease_id
-  if (-not $lease) { Fail "could not parse compatibility lease id from run: $($r.Out)" }
+  if (-not $lease) { Fail "could not parse lease id from run: $($r.Out)" }
+  if ($grant.env_var -ne 'API_TOKEN') { Fail "run grant did not report injected env var: $($r.Out)" }
 
-  $r = Invoke-Prout -ArgList @('execute', '--conversation', $cid, '--', 'powershell', '-NoProfile', '-Command', $child)
+  $r = Invoke-Prout -ArgList @('execute', '--lease', $lease)
   if ($r.Code -ne 0) { Fail "execute injection failed: rc=$($r.Code) out=$($r.Out) err=$($r.Err)" }
   if (($r.Out + $r.Err).Contains('inject-secret')) { Fail 'execute output leaked injected credential' }
   if (-not $r.Out.Contains('*************')) { Fail "execute did not redact leaked credential bytes: out=$($r.Out)" }
 
-  $r = Invoke-Prout -ArgList @('run', '--service', 'github/personal', '--intent', 'update the local integration fixture with the configured token')
+  $r = Invoke-Prout -ArgList @('run', '--service', 'github/personal', '--intent', 'update the local integration fixture with the configured token', '--', 'powershell', '-NoProfile', '-Command', 'Invoke-WebRequest https://evil.example.test')
   if ($r.Code -ne 0) { Fail "domain mismatch negotiation failed: rc=$($r.Code) out=$($r.Out) err=$($r.Err)" }
   $badGrant = $r.Out | ConvertFrom-Json
-  $r = Invoke-Prout -ArgList @('execute', '--conversation', $badGrant.conversation_id, '--', 'powershell', '-NoProfile', '-Command', 'Invoke-WebRequest https://evil.example.test')
+  $r = Invoke-Prout -ArgList @('execute', '--lease', $badGrant.lease_id)
   if ($r.Code -ne 11) { Fail "domain mismatch was not denied: rc=$($r.Code) out=$($r.Out) err=$($r.Err)" }
 
-  $r = Invoke-Prout -ArgList @('execute', '--conversation', $cid, '--', 'powershell', '-NoProfile', '-Command', 'exit 0')
-  if ($r.Code -ne 11 -and $r.Code -ne 1) { Fail "reused execute conversation was not rejected: rc=$($r.Code) out=$($r.Out) err=$($r.Err)" }
+  $r = Invoke-Prout -ArgList @('execute', '--lease', $lease)
+  if ($r.Code -ne 0) { Fail "second execute with lease failed: rc=$($r.Code) out=$($r.Out) err=$($r.Err)" }
+
+  $r = Invoke-Prout -ArgList @('execute', '--lease', $lease)
+  if ($r.Code -ne 11 -and $r.Code -ne 1) { Fail "exhausted lease was not rejected: rc=$($r.Code) out=$($r.Out) err=$($r.Err)" }
 
   $r = Invoke-Prout -ArgList @('run', '--lease', $lease, '--', 'powershell', '-NoProfile', '-Command', "if (`$env:API_TOKEN -eq 'inject-secret') { exit 0 } else { exit 3 }")
-  if ($r.Code -ne 0) { Fail "lease reuse failed without service: rc=$($r.Code) out=$($r.Out) err=$($r.Err)" }
+  if ($r.Code -eq 0) { Fail "run --lease unexpectedly executed: out=$($r.Out) err=$($r.Err)" }
 
   $r = Invoke-Prout -ArgList @('expose', '--service', 'github/personal', '--intent', 'read token for debugging')
   if ($r.Code -ne 11) { Fail "inject-only service was revealable: rc=$($r.Code) out=$($r.Out) err=$($r.Err)" }
@@ -126,12 +130,16 @@ try {
   $revealGrant = $r.Out | ConvertFrom-Json
   $revealCid = $revealGrant.conversation_id
   if (-not $revealCid) { Fail "could not parse reveal conversation id: $($r.Out)" }
+  $revealLease = $revealGrant.lease_id
+  if (-not $revealLease) { Fail "could not parse reveal lease id: $($r.Out)" }
   $r = Invoke-Prout -ArgList @('expose', '--conversation', $revealCid)
+  if ($r.Code -eq 0) { Fail "final expose by conversation unexpectedly succeeded: out=$($r.Out) err=$($r.Err)" }
+  $r = Invoke-Prout -ArgList @('expose', '--lease', $revealLease)
   if ($r.Code -ne 0) { Fail "final expose failed: rc=$($r.Code) out=$($r.Out) err=$($r.Err)" }
   if (-not $r.Out.Contains('reveal-secret')) { Fail 'final expose did not return credential' }
 
   $shouldNotRun = Join-Path $root 'should-not-run.txt'
-  $r = Invoke-Prout -ArgList @('run', '--service', 'github/personal', '--intent', 'fix')
+  $r = Invoke-Prout -ArgList @('run', '--service', 'github/personal', '--intent', 'fix', '--', 'powershell', '-NoProfile', '-Command', "if (`$env:API_TOKEN -eq 'inject-secret') { exit 0 } else { exit 3 }")
   if ($r.Code -ne 10) { Fail "vague intent did not return question exit 10: rc=$($r.Code) out=$($r.Out) err=$($r.Err)" }
   if (Test-Path $shouldNotRun) { Fail 'child command ran despite question response' }
   $question = $r.Out | ConvertFrom-Json
@@ -142,7 +150,7 @@ try {
   if ($r.Code -ne 0) { Fail "run details did not resume negotiation: rc=$($r.Code) out=$($r.Out) err=$($r.Err)" }
   $grant = $r.Out | ConvertFrom-Json
   $cid2 = $grant.conversation_id
-  $r = Invoke-Prout -ArgList @('execute', '--conversation', $cid2, '--', 'powershell', '-NoProfile', '-Command', "if (`$env:API_TOKEN -eq 'inject-secret') { exit 0 } else { exit 3 }")
+  $r = Invoke-Prout -ArgList @('execute', '--lease', $grant.lease_id)
   if ($r.Code -ne 0) { Fail "execute after details failed: rc=$($r.Code) out=$($r.Out) err=$($r.Err)" }
 
   $r = Invoke-Prout -ArgList @('audit', 'conversation', $cid)

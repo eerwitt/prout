@@ -78,10 +78,13 @@ struct Conversation {
   std::string details;
   std::string arbiter_id;
   std::string rationale;
+  std::string lease_id;
+  std::vector<std::string> command;
+  std::string command_summary;
   std::uint32_t ttl_seconds = 0;
   std::uint32_t max_uses = 0;
+  std::uint32_t lease_uses_remaining = 0;
   bool approved = false;
-  bool delivered = false;
   std::chrono::steady_clock::time_point expires_at;
 };
 
@@ -108,8 +111,6 @@ public:
       return ExecuteResult(req);
     if (op == "expose_final")
       return ExposeFinal(req);
-    if (op == "reuse")
-      return Reuse(req);
     return Error("unknown op '" + op + "'");
   }
 
@@ -178,7 +179,6 @@ private:
                       "' does not permit revealing its value; use `prout run`");
     c.id = NewConversationId();
     c.approved = true;
-    c.delivered = false;
     c.rationale = v.rationale;
     c.ttl_seconds = v.ttl_seconds;
     c.max_uses = v.max_uses;
@@ -188,14 +188,16 @@ private:
     if (!lease_id_or.ok())
       return Error("could not create lease: " +
                    std::string(lease_id_or.status().message()));
-    std::string lease_id = *lease_id_or;
+    c.lease_id = *lease_id_or;
     conversations_[c.id] = c;
+    lease_conversations_[c.lease_id] = c.id;
     auto st = Audit(AuditEntry{.conversation_id = c.id,
                                .event = "grant",
                                .agent = c.agent,
                                .service = c.service,
                                .intent = c.intent,
                                .details = c.details,
+                               .command_summary = c.command_summary,
                                .transcript = Transcript(c),
                                .verdict = "granted",
                                .rationale = c.rationale,
@@ -205,10 +207,15 @@ private:
     if (!st.ok())
       return AuditError(st);
     return json{
-        {"status", "granted"},     {"conversation_id", c.id},
-        {"lease_id", lease_id},    {"service", c.service},
-        {"kind", c.kind},          {"ttl_seconds", c.ttl_seconds},
-        {"max_uses", c.max_uses},  {"disclosure", DisclosureName(s.disclosure)},
+        {"status", "granted"},
+        {"conversation_id", c.id},
+        {"lease_id", c.lease_id},
+        {"service", c.service},
+        {"kind", c.kind},
+        {"ttl_seconds", c.ttl_seconds},
+        {"max_uses", c.max_uses},
+        {"disclosure", DisclosureName(s.disclosure)},
+        {"env_var", s.disclosure == Disclosure::kInject ? s.inject_env : ""},
         {"rationale", c.rationale}}
         .dump();
   }
@@ -222,7 +229,6 @@ private:
   bool Expired(const Conversation &c) const {
     return std::chrono::steady_clock::now() >= c.expires_at;
   }
-
   bool CommandFits(const Conversation &c, const std::string &command) const {
     std::string text = Lower(c.intent + " " + c.details);
     std::string cmd = Lower(command);
@@ -294,6 +300,7 @@ private:
                            s.credential.size());
     json r{
         {"status", "deliver"},     {"conversation_id", c.id},
+        {"lease_id", c.lease_id},  {"command", c.command},
         {"service", c.service},    {"kind", c.kind},
         {"env_var", s.inject_env}, {"disclosure", DisclosureName(s.disclosure)},
         {"credential", credential}};
@@ -309,6 +316,8 @@ private:
     c.service = req.value("service", "");
     c.agent = req.value("agent", "agent");
     c.intent = req.value("intent", "");
+    c.command = req.value("command", std::vector<std::string>{});
+    c.command_summary = req.value("command_summary", "");
     c.expires_at = std::chrono::steady_clock::now() + std::chrono::minutes(10);
     if (c.kind != "run" && c.kind != "expose")
       return Error("invalid conversation kind");
@@ -317,6 +326,8 @@ private:
       return Error("unknown service '" + c.service + "'");
     if (c.intent.empty())
       return Error("missing intent");
+    if (c.kind == "run" && c.command.empty())
+      return Error("run requires a command after `--`");
 
     std::string arbiter_id;
     Verdict v = arbiter_->Begin(*s, c.agent, c.intent, &arbiter_id);
@@ -358,41 +369,53 @@ private:
   }
 
   std::string Execute(const json &req) {
-    std::string id = req.value("conversation_id", "");
-    std::string command = req.value("command_summary", "");
+    std::string lease_id = req.value("lease_id", "");
+    auto lease_it = lease_conversations_.find(lease_id);
+    if (lease_it == lease_conversations_.end()) {
+      Conversation c{.id = lease_id, .kind = "run", .lease_id = lease_id};
+      return Deny(c, "no such lease", "execute");
+    }
+    std::string id = lease_it->second;
     auto it = conversations_.find(id);
-    if (it == conversations_.end())
-      return Error("unknown or expired conversation id '" + id + "'");
+    if (it == conversations_.end()) {
+      lease_conversations_.erase(lease_it);
+      Conversation c{.id = lease_id, .kind = "run", .lease_id = lease_id};
+      return Deny(c, "no such lease", "execute");
+    }
     Conversation &c = it->second;
     if (Expired(c)) {
       Conversation copy = c;
+      lease_conversations_.erase(c.lease_id);
       conversations_.erase(it);
-      return Deny(copy, "conversation expired", "execute", command);
+      return Deny(copy, "conversation expired", "execute",
+                  copy.command_summary);
     }
     if (!c.approved || c.kind != "run")
-      return Deny(c, "conversation is not approved for execute", "execute",
-                  command);
-    if (c.delivered)
-      return Deny(c, "conversation already consumed", "execute", command);
-    if (!CommandFits(c, command))
+      return Deny(c, "lease is not approved for execute", "execute",
+                  c.command_summary);
+    if (!CommandFits(c, c.command_summary))
       return Deny(c, "command does not fit the approved conversation context",
-                  "execute", command);
+                  "execute", c.command_summary);
     const Service *s = vault_.Find(c.service);
     if (!s)
       return Error("service vanished from vault");
-    if (!CommandTargetsServiceHost(*s, command))
+    if (!CommandTargetsServiceHost(*s, c.command_summary))
       return Deny(
           c, "command targets a different website host than the service policy",
-          "execute", command);
-    c.delivered = true;
-    c.details = c.details;
+          "execute", c.command_summary);
+    std::uint32_t left = 0;
+    std::string service;
+    auto lease_status = leases_.Consume(lease_id, c.service, &left, &service);
+    if (lease_status != LeaseTable::Status::kOk)
+      return Deny(c, LeaseReason(lease_status), "execute", c.command_summary);
+    c.lease_uses_remaining = left;
     auto st = Audit(AuditEntry{.conversation_id = c.id,
                                .event = "execute_start",
                                .agent = c.agent,
                                .service = c.service,
                                .intent = c.intent,
                                .details = c.details,
-                               .command_summary = command,
+                               .command_summary = c.command_summary,
                                .transcript = Transcript(c),
                                .verdict = "granted",
                                .rationale = c.rationale,
@@ -410,7 +433,10 @@ private:
     if (it == conversations_.end())
       return json{{"status", "ok"}}.dump();
     Conversation c = it->second;
-    conversations_.erase(it);
+    if (c.lease_uses_remaining == 0) {
+      lease_conversations_.erase(c.lease_id);
+      conversations_.erase(it);
+    }
     const Service *s = vault_.Find(c.service);
     auto st =
         Audit(AuditEntry{.conversation_id = c.id,
@@ -419,6 +445,7 @@ private:
                          .service = c.service,
                          .intent = c.intent,
                          .details = c.details,
+                         .command_summary = c.command_summary,
                          .transcript = Transcript(c),
                          .verdict = "granted",
                          .rationale = c.rationale,
@@ -433,74 +460,64 @@ private:
   }
 
   std::string ExposeFinal(const json &req) {
-    std::string id = req.value("conversation_id", "");
+    std::string lease_id = req.value("lease_id", "");
+    auto lease_it = lease_conversations_.find(lease_id);
+    if (lease_it == lease_conversations_.end()) {
+      Conversation c{.id = lease_id, .kind = "expose", .lease_id = lease_id};
+      return Deny(c, "no such lease", "expose_final");
+    }
+    std::string id = lease_it->second;
     auto it = conversations_.find(id);
-    if (it == conversations_.end())
-      return Error("unknown or expired conversation id '" + id + "'");
-    Conversation c = it->second;
-    conversations_.erase(it);
-    if (Expired(c))
-      return Deny(c, "conversation expired", "expose_final");
+    if (it == conversations_.end()) {
+      lease_conversations_.erase(lease_it);
+      Conversation c{.id = lease_id, .kind = "expose", .lease_id = lease_id};
+      return Deny(c, "no such lease", "expose_final");
+    }
+    Conversation &c = it->second;
+    if (Expired(c)) {
+      Conversation copy = c;
+      lease_conversations_.erase(c.lease_id);
+      conversations_.erase(it);
+      return Deny(copy, "conversation expired", "expose_final");
+    }
     if (!c.approved || c.kind != "expose")
-      return Deny(c, "conversation is not approved for expose", "expose_final");
-    const Service *s = vault_.Find(c.service);
+      return Deny(c, "lease is not approved for expose", "expose_final");
+    std::uint32_t left = 0;
+    std::string service;
+    auto lease_status = leases_.Consume(lease_id, c.service, &left, &service);
+    if (lease_status != LeaseTable::Status::kOk) {
+      Conversation denied = c;
+      lease_conversations_.erase(c.lease_id);
+      conversations_.erase(it);
+      return Deny(denied, LeaseReason(lease_status), "expose_final");
+    }
+    c.lease_uses_remaining = left;
+    Conversation delivered = c;
+    if (left == 0) {
+      lease_conversations_.erase(c.lease_id);
+      conversations_.erase(it);
+    }
+    const Service *s = vault_.Find(delivered.service);
     if (!s)
       return Error("service vanished from vault");
     if (s->disclosure != Disclosure::kReveal)
-      return Deny(c, "service does not permit revealing its value",
+      return Deny(delivered, "service does not permit revealing its value",
                   "expose_final");
-    auto st = Audit(AuditEntry{.conversation_id = c.id,
+    auto st = Audit(AuditEntry{.conversation_id = delivered.id,
                                .event = "expose_final",
-                               .agent = c.agent,
-                               .service = c.service,
-                               .intent = c.intent,
-                               .details = c.details,
-                               .transcript = Transcript(c),
+                               .agent = delivered.agent,
+                               .service = delivered.service,
+                               .intent = delivered.intent,
+                               .details = delivered.details,
+                               .transcript = Transcript(delivered),
                                .verdict = "granted",
-                               .rationale = c.rationale,
-                               .ttl_seconds = c.ttl_seconds,
-                               .max_uses = c.max_uses,
+                               .rationale = delivered.rationale,
+                               .ttl_seconds = delivered.ttl_seconds,
+                               .max_uses = delivered.max_uses,
                                .disclosure = DisclosureName(s->disclosure)});
     if (!st.ok())
       return AuditError(st);
-    return DeliverCredential(c, *s);
-  }
-
-  std::string Reuse(const json &req) {
-    std::string lease_id = req.value("lease_id", "");
-    std::string agent = req.value("agent", "agent");
-    std::uint32_t left = 0;
-    std::string service;
-    auto lease_status = leases_.Consume(lease_id, "", &left, &service);
-    if (lease_status != LeaseTable::Status::kOk) {
-      Conversation c{.id = lease_id,
-                     .kind = "run",
-                     .service = service,
-                     .agent = agent,
-                     .intent = "(lease reuse)"};
-      return Deny(c, LeaseReason(lease_status), "lease_reuse");
-    }
-    const Service *s = vault_.Find(service);
-    if (!s)
-      return Error("unknown service for lease");
-    Conversation c{.id = lease_id,
-                   .kind = "run",
-                   .service = service,
-                   .agent = agent,
-                   .intent = "(lease reuse)",
-                   .rationale = "reused existing lease"};
-    auto st = Audit(AuditEntry{.conversation_id = c.id,
-                               .event = "lease_reuse",
-                               .agent = agent,
-                               .service = service,
-                               .intent = "(lease reuse)",
-                               .transcript = "reuse lease " + lease_id,
-                               .verdict = "granted",
-                               .rationale = "reused existing lease",
-                               .disclosure = DisclosureName(s->disclosure)});
-    if (!st.ok())
-      return AuditError(st);
-    return DeliverCredential(c, *s);
+    return DeliverCredential(delivered, *s);
   }
 
   Vault vault_;
@@ -508,6 +525,7 @@ private:
   AuditLog audit_;
   LeaseTable leases_;
   std::map<std::string, Conversation> conversations_;
+  std::map<std::string, std::string> lease_conversations_;
 };
 
 } // namespace

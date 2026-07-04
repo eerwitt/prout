@@ -127,6 +127,20 @@ if(WIN32)
   set(LITERT_WEBGPU_DAWN_DLL
       "${LITERT_LM_ROOT}/prebuilt/windows_x86_64/libwebgpu_dawn.dll"
       CACHE FILEPATH "Path to libwebgpu_dawn.dll")
+  set(DXC_REDIST_HINTS
+      "$ENV{WindowsSdkDir}bin/$ENV{WindowsSDKVersion}/x64"
+      "C:/Program Files (x86)/Windows Kits/10/bin/10.0.26100.0/x64"
+      "C:/Program Files (x86)/Windows Kits/10/bin/10.0.22621.0/x64"
+      "$ENV{WindowsSdkDir}Redist/D3D/x64"
+      "C:/Program Files (x86)/Windows Kits/10/Redist/D3D/x64")
+  find_file(PROUT_DXIL_DLL
+      NAMES dxil.dll
+      HINTS ${DXC_REDIST_HINTS}
+      REQUIRED)
+  find_file(PROUT_DXCOMPILER_DLL
+      NAMES dxcompiler.dll
+      HINTS ${DXC_REDIST_HINTS}
+      REQUIRED)
 
   add_custom_command(TARGET prout POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E make_directory "${PROUT_DIST_DIR}"
@@ -144,6 +158,10 @@ if(WIN32)
             "${LITERT_TOPK_WEBGPU_SAMPLER_DLL}" "${PROUT_DIST_DIR}/"
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
             "${LITERT_WEBGPU_DAWN_DLL}" "${PROUT_DIST_DIR}/"
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${PROUT_DXIL_DLL}" "${PROUT_DIST_DIR}/"
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${PROUT_DXCOMPILER_DLL}" "${PROUT_DIST_DIR}/"
     COMMENT "Staging prout.exe + CPU/GPU LiteRT runtime DLLs into dist/")
 endif()
 
