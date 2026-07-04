@@ -334,10 +334,33 @@ absl::Status IpcServer::Listen(const std::string &socket_path) {
     CloseSock(s);
     return absl::InvalidArgumentError("socket path too long");
   }
-  if (::bind(s, reinterpret_cast<sockaddr *>(&addr), sizeof(addr)) != 0) {
+  bool bound = ::bind(s, reinterpret_cast<sockaddr *>(&addr), sizeof(addr)) == 0;
+#if defined(_WIN32)
+  int bind_error = bound ? 0 : WSAGetLastError();
+  if (!bound && bind_error == WSAEADDRINUSE) {
+    CloseSock(s);
+    fs::remove(sock_path, ec);
+    if (ec) {
+      return absl::UnavailableError("cannot remove stale socket: " +
+                                    ec.message());
+    }
+    s = ::socket(AF_UNIX, SOCK_STREAM, 0);
+    if (s == kBadSock)
+      return absl::InternalError("socket(): " + SockErr());
+    SetSocketTimeouts(s);
+    bound = ::bind(s, reinterpret_cast<sockaddr *>(&addr), sizeof(addr)) == 0;
+    bind_error = bound ? 0 : WSAGetLastError();
+  }
+#endif
+  if (!bound) {
+#if defined(_WIN32)
+    std::string err = "winsock error " + std::to_string(bind_error);
+#else
+    std::string err = SockErr();
+#endif
     CloseSock(s);
     return absl::UnavailableError(
-        "bind() failed (another daemon already running?): " + SockErr());
+        "bind() failed (another daemon already running?): " + err);
   }
   auto secure_socket = SecureSocketPath(sock_path);
   if (!secure_socket.ok()) {
@@ -361,6 +384,25 @@ absl::Status IpcServer::Serve(const Handler &handler,
     return absl::FailedPreconditionError("not listening");
   socket_t srv = static_cast<socket_t>(fd_);
   while (!stop()) {
+    fd_set readfds;
+    FD_ZERO(&readfds);
+    FD_SET(srv, &readfds);
+    timeval tv{};
+    tv.tv_sec = 0;
+    tv.tv_usec = 250000;
+#if defined(_WIN32)
+    int ready = ::select(0, &readfds, nullptr, nullptr, &tv);
+#else
+    int ready = ::select(srv + 1, &readfds, nullptr, nullptr, &tv);
+#endif
+    if (ready == 0)
+      continue;
+    if (ready < 0) {
+      if (stop())
+        break;
+      continue;
+    }
+
     socket_t c = ::accept(srv, nullptr, nullptr);
     if (c == kBadSock) {
       if (stop())

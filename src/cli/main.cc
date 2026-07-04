@@ -19,7 +19,12 @@ void Usage() {
       "  expose --service <name> --intent <text> [--agent <name>]\n"
       "  expose --conversation <id> [--details <text>] [--agent <name>]\n"
       "  execute --conversation <id> -- <cmd...>\n"
-      "  audit tail|verify|conversation [--vault <dir>]\n");
+      "  audit tail|verify|conversation [--vault <dir>]\n\n"
+      "inject flow:\n"
+      "  prout run --service <name> --intent \"<why>\" [--agent <name>]\n"
+      "  prout execute --conversation <approved-id> -- <cmd...>\n"
+      "  # if run returns status=question, answer with:\n"
+      "  prout run --conversation <id> --details \"<answer>\" [--agent <name>]\n");
 }
 
 std::vector<std::string> TailArgs(int argc, char **argv) {

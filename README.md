@@ -36,6 +36,32 @@ Exit codes are stable for agents: `0` success, `1` error, `10` question, `11` de
 
 `serve --model <path>` is optional. Without a model, Prout uses a deterministic heuristic arbiter so local smoke tests and agent scripts can exercise the full vault/lease/audit flow. With a model, Prout uses the LiteRT-LM C Conversation API.
 
+## Run and Execute Flow
+
+Use one terminal for the daemon:
+
+```powershell
+.\dist\prout.exe serve --model C:\Users\eerwi\models\gemma-4-E2B-it-litert-lm\gemma-4-E2B-it.litertlm --backend cpu
+```
+
+Use another terminal to negotiate a credential lease. `run` does not execute the website/API check; it returns safe JSON metadata and, when approved, a `conversation_id` for the next command.
+
+```powershell
+.\dist\prout.exe run --service ml.huggingface --intent "checking the token is valid against the website" --agent local
+```
+
+If the response has `"status":"question"`, answer with the returned conversation id:
+
+```powershell
+.\dist\prout.exe run --conversation <question-conversation-id> --details "Validate the Hugging Face token with the whoami API once, without changing account state." --agent local
+```
+
+When the response has `"status":"granted"`, pass its `conversation_id` to `execute`. The daemon injects the credential into the environment variable configured by `vault add --env`; this example assumes the service was added with `--env HF_TOKEN`.
+
+```powershell
+.\dist\prout.exe execute --conversation <approved-conversation-id> -- powershell -NoProfile -Command '$h=@{Authorization=("Bearer " + $env:HF_TOKEN)}; Invoke-RestMethod -Headers $h -Uri https://huggingface.co/api/whoami-v2'
+```
+
 ## Arbiter Schema
 
 The external arbiter response format is one JSON object:

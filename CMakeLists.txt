@@ -115,6 +115,18 @@ if(WIN32)
   set(LITERT_LM_CONSTRAINT_DLL
       "${LITERT_LM_ROOT}/prebuilt/windows_x86_64/libGemmaModelConstraintProvider.dll"
       CACHE FILEPATH "Path to libGemmaModelConstraintProvider.dll")
+  set(LITERT_RUNTIME_DLL
+      "${LITERT_LM_ROOT}/prebuilt/windows_x86_64/libLiteRt.dll"
+      CACHE FILEPATH "Path to libLiteRt.dll")
+  set(LITERT_WEBGPU_ACCELERATOR_DLL
+      "${LITERT_LM_ROOT}/prebuilt/windows_x86_64/libLiteRtWebGpuAccelerator.dll"
+      CACHE FILEPATH "Path to libLiteRtWebGpuAccelerator.dll")
+  set(LITERT_TOPK_WEBGPU_SAMPLER_DLL
+      "${LITERT_LM_ROOT}/prebuilt/windows_x86_64/libLiteRtTopKWebGpuSampler.dll"
+      CACHE FILEPATH "Path to libLiteRtTopKWebGpuSampler.dll")
+  set(LITERT_WEBGPU_DAWN_DLL
+      "${LITERT_LM_ROOT}/prebuilt/windows_x86_64/libwebgpu_dawn.dll"
+      CACHE FILEPATH "Path to libwebgpu_dawn.dll")
 
   add_custom_command(TARGET prout POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E make_directory "${PROUT_DIST_DIR}"
@@ -124,7 +136,15 @@ if(WIN32)
             "${LITERT_LM_DLL}" "${PROUT_DIST_DIR}/"
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
             "${LITERT_LM_CONSTRAINT_DLL}" "${PROUT_DIST_DIR}/"
-    COMMENT "Staging prout.exe + litert-lm.dll + constraint provider into dist/")
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${LITERT_RUNTIME_DLL}" "${PROUT_DIST_DIR}/"
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${LITERT_WEBGPU_ACCELERATOR_DLL}" "${PROUT_DIST_DIR}/"
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${LITERT_TOPK_WEBGPU_SAMPLER_DLL}" "${PROUT_DIST_DIR}/"
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${LITERT_WEBGPU_DAWN_DLL}" "${PROUT_DIST_DIR}/"
+    COMMENT "Staging prout.exe + CPU/GPU LiteRT runtime DLLs into dist/")
 endif()
 
 set(PROUT_CLANG_FORMAT_HINTS)

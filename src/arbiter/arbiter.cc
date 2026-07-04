@@ -214,7 +214,10 @@ private:
 
   LiteRtLmConversation *CreateConversation(const std::string &system_prompt) {
     LiteRtLmSamplerParams *sampler =
-        litert_lm_sampler_params_create(kLiteRtLmSamplerTypeGreedy);
+        litert_lm_sampler_params_create(kLiteRtLmSamplerTypeTopP);
+    litert_lm_sampler_params_set_top_k(sampler, 1);
+    litert_lm_sampler_params_set_top_p(sampler, 1.0f);
+    litert_lm_sampler_params_set_temperature(sampler, 0.1f);
     LiteRtLmSessionConfig *sess = litert_lm_session_config_create();
     litert_lm_session_config_set_sampler_params(sess, sampler);
     litert_lm_session_config_set_max_output_tokens(sess, 256);
