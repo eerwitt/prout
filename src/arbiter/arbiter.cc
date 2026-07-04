@@ -92,33 +92,45 @@ std::string ExtractAssistantText(const std::string &dump) {
 std::string BuildSystemPrompt(const Service &s) {
   const Policy &p = s.policy;
   std::ostringstream o;
-  o << "You are Prout's local credential-lease arbiter. You are NOT being "
-       "asked to use, validate, reveal, inspect, or receive the credential. "
-       "Another process will do the requested task later if Prout grants a "
-       "lease. Your only job is to decide whether the agent's stated intent "
-       "and requested command deserve a short-lived credential lease under "
-       "the owner policy.\n\n";
+  o << "You are Prout's credential-lease arbiter. Decide whether the requested "
+       "command should receive a short-lived lease for the stored credential. "
+       "Do not perform the task. Do not ask for or handle the credential "
+       "value.\n\n";
   o << "Stored credential description: "
     << (p.description.empty() ? s.name : p.description) << "\n";
   o << "Policy ceilings (code clamps these): max_ttl_seconds="
     << p.max_ttl_seconds << ", max_uses=" << p.max_uses << "\n";
   if (!p.guidance.empty())
     o << "Owner guidance: " << p.guidance << "\n";
-  o << "\nDo not ask for the credential value. Do not deny merely because you "
-       "cannot access websites or APIs; the requester, not you, will perform "
-       "the external action. Granting is the normal outcome for a concrete, "
-       "benign, service-relevant intent and command. Deny if the intent or "
-       "command is abusive, contradictory, impossible for this credential, "
-       "nonsensical, targets an unrelated service or host, exfiltrates the "
-       "credential, or performs destructive work not justified by the stated "
-       "intent. Ask a question only if the intent or command is too vague to "
-       "size a lease. A request to validate/check a stored token against its "
-       "own service is normally a read-only diagnostic intent; if the exact "
-       "endpoint or command is unclear, ask for those details instead of "
-       "denying.\n\n"
+  o << "\nDecision rules:\n"
+       "- Grant concrete, benign requests that use this credential for this "
+       "service.\n"
+       "- Grant read-only or diagnostic requests against the service's own "
+       "host, including authenticated/private account reads, unless a deny "
+       "rule applies.\n"
+       "- Inspect the whole requested_command, not just the first action. "
+       "Check commands after ';', '&&', pipes, redirects, subshells, and "
+       "nested shell -Command strings.\n"
+       "- Ask a question only when one missing fact prevents sizing or judging "
+       "the lease.\n"
+       "- Deny only for a concrete blocker: unrelated host/service, credential "
+       "exfiltration, destructive work not justified by the intent, abusive "
+       "use, contradiction between intent and command, impossible use, or "
+       "nonsensical request.\n"
+       "- Treat printing, echoing, logging, copying, saving, uploading, or "
+       "otherwise revealing the credential or its delivery environment "
+       "variable as credential exfiltration. Using the credential only in an "
+       "Authorization header to the service host is not exfiltration.\n"
+       "- Do not deny because you cannot access websites or APIs.\n\n"
+       "Rationale rules:\n"
+       "- Grant rationale: name the allowed use and lease size reason.\n"
+       "- Question text: ask only for the missing fact needed to decide.\n"
+       "- Deny rationale: state the specific blocking rule and the evidence "
+       "from the intent or command.\n"
+       "- Never use a rationale that only repeats or summarizes the request.\n\n"
        "Call exactly one registered tool: grant_lease, ask_question, or "
-       "deny_request. Put the complete rationale in the tool arguments. If "
-       "tool calling is unavailable, respond with EXACTLY ONE JSON object and "
+       "deny_request. If tool calling is unavailable, respond with EXACTLY "
+       "ONE JSON object and "
        "nothing else using one of these shapes:\n"
        "  {\"type\":\"lease\",\"ttl_seconds\":<int>,\"max_uses\":<int>,"
        "\"rationale\":\"<one sentence>\"}\n"
@@ -133,7 +145,7 @@ std::string InitialUserText(const Service &s, const std::string &agent,
                             const std::string &command_summary) {
   std::ostringstream o;
   o << "Lease request metadata:\n";
-  o << "agent=" << agent << "\n";
+  o << "requester_agent_name=" << agent << "\n";
   o << "service=" << s.name << "\n";
   if (!s.website_host.empty())
     o << "service_host=" << s.website_host << "\n";
@@ -142,14 +154,15 @@ std::string InitialUserText(const Service &s, const std::string &agent,
   if (!s.company.empty())
     o << "company=" << s.company << "\n";
   if (!s.inject_env.empty())
-    o << "delivery_env_var=" << s.inject_env << "\n";
+    o << "credential_delivery_env_var=" << s.inject_env << "\n";
   o << "disclosure=" << DisclosureName(s.disclosure) << "\n";
   o << "intent=" << intent << "\n\n";
   if (!command_summary.empty())
     o << "requested_command=" << command_summary << "\n\n";
-  o << "Decide whether this intent and requested command should receive a "
-       "credential lease. Do not perform the task and do not ask for the "
-       "credential value.";
+  o << "Notes: requester_agent_name is only the caller label. "
+       "credential_delivery_env_var is where Prout injects the credential if "
+       "a lease is granted. A command that prints or stores that variable "
+       "must be denied as credential exfiltration. Decide the lease only.";
   return o.str();
 }
 
@@ -184,21 +197,27 @@ std::string ArbiterToolsJson() {
       {"function",
        {{"name", "grant_lease"},
         {"description",
-         "Grant a short-lived credential lease for a concrete benign intent."},
+         "Grant a lease. Rationale must name the allowed use and lease size "
+         "reason."},
         {"parameters", grant_params}}}};
   json question = {
       {"type", "function"},
       {"function",
        {{"name", "ask_question"},
         {"description",
-         "Ask one concise follow-up question when the intent is too vague."},
+         "Ask one concise follow-up question naming only the missing fact "
+         "needed to decide."},
         {"parameters", question_params}}}};
   json deny = {
       {"type", "function"},
       {"function",
        {{"name", "deny_request"},
         {"description", "Deny only when the requested credential use is "
-                        "unsafe, impossible, contradictory, or nonsensical."},
+                        "unsafe, impossible, contradictory, nonsensical, "
+                        "unrelated to the service, or otherwise blocked. The "
+                        "rationale must name the blocking rule and evidence, "
+                        "not summarize the request. Printing or dumping the "
+                        "credential env var is credential exfiltration."},
         {"parameters", deny_params}}}};
   return json::array({grant, question, deny}).dump();
 }
