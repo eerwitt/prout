@@ -104,12 +104,18 @@ std::string BuildSystemPrompt(const Service &s) {
   o << "\nDecision rules:\n"
        "- Grant concrete, benign requests that use this credential for this "
        "service or its configured host.\n"
+       "- Grant read-only authenticated account/profile checks on the service "
+       "host. Passing the credential as an Authorization header to that host "
+       "is normal use, not exfiltration.\n"
        "- Inspect the whole requested_command, including actions after ';', "
        "'&&', pipes, redirects, subshells, and nested shell -Command strings.\n"
        "- Ask a question only when one missing fact prevents a decision.\n"
        "- Deny only for a concrete blocker: "
-       "exfiltration, unjustified destructive work, abusive use, contradiction "
-       "between intent and command, impossible use, or nonsense.\n\n"
+       "unrelated host/service, credential exfiltration, unjustified "
+       "destructive work, abusive use, contradiction between intent and "
+       "command, impossible use, or nonsense.\n"
+       "- Credential exfiltration means printing, logging, saving, uploading, "
+       "or otherwise revealing the credential value or delivery env var.\n\n"
        "Rationale rules:\n"
        "- Grant rationale: name the allowed use and lease size reason.\n"
        "- Question text: ask only for the missing fact needed to decide.\n"
@@ -203,7 +209,9 @@ std::string ArbiterToolsJson() {
                         "unrelated to the service, or otherwise blocked. The "
                         "rationale must name the blocking rule and evidence, "
                         "not summarize the request. Printing or dumping the "
-                        "credential env var is credential exfiltration."},
+                        "credential env var is credential exfiltration; using "
+                        "it in an Authorization header to the service host is "
+                        "not."},
         {"parameters", deny_params}}}};
   return json::array({grant, question, deny}).dump();
 }

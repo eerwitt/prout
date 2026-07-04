@@ -192,9 +192,8 @@ int SpawnChildFiltered(const std::vector<std::string> &command,
   PROCESS_INFORMATION pi{};
   std::string cmdline = WindowsCommandLine(command);
   SetEnv(env_var, cred.c_str());
-  BOOL created =
-      CreateProcessA(nullptr, cmdline.data(), nullptr, nullptr, TRUE, 0,
-                     nullptr, nullptr, &si, &pi);
+  BOOL created = CreateProcessA(nullptr, cmdline.data(), nullptr, nullptr, TRUE,
+                                0, nullptr, nullptr, &si, &pi);
   UnsetEnv(env_var);
   CloseHandle(write_handle);
   if (!created) {
