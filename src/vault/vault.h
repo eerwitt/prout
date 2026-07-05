@@ -1,7 +1,7 @@
-// The encrypted credential store. On disk it is a single XChaCha20-Poly1305
-// blob keyed by an Argon2id passphrase derivation; in memory the decrypted
-// credentials live in locked SecureBuffers. Each service carries the policy the
-// arbiter reasons against and the ceilings code clamps lease terms to.
+// The encrypted credential store. On disk it is an append-only set of
+// per-machine vault-<machine>.jsonl logs keyed by an Argon2id passphrase
+// derivation. Each encrypted mutation is hash-chained inside its machine log,
+// then all logs are replayed into the effective in-memory vault state.
 #pragma once
 
 #include <cstdint>
@@ -46,41 +46,59 @@ struct Service {
   SecureBuffer credential; // decrypted secret, locked in memory
 };
 
+struct VaultHistoryEntry {
+  std::string revision_id;
+  std::string machine;
+  std::string timestamp;
+  std::string action;
+  std::string service;
+  std::vector<std::string> fields;
+  bool active = false;
+};
+
 class Vault {
 public:
-  // Loads and decrypts <dir>/vault.json with `passphrase`.
+  // Loads, verifies, decrypts, and replays <dir>/vault-*.jsonl.
   static absl::StatusOr<Vault> Open(const std::string &dir,
                                     const std::string &passphrase);
-  // Creates a fresh empty vault in `dir`, encrypted under `passphrase`.
+  // Creates a fresh empty vault log in `dir`, encrypted under `passphrase`.
   static absl::Status Init(const std::string &dir,
                            const std::string &passphrase);
 
-  // Re-encrypts and writes the vault back to disk.
-  absl::Status Save() const;
+  // Verifies every vault log without exposing credential values.
+  static absl::Status Verify(const std::string &dir,
+                             const std::string &passphrase);
 
-  // Adds or replaces a service, then persists. `credential` is consumed.
+  // Adds a service, then appends metadata, policy, and credential revisions.
+  // `credential` is consumed.
   absl::Status AddService(Service service, SecureBuffer credential);
 
-  // Edits an existing service, then persists. If `credential` is non-null it is
-  // consumed and replaces the old credential.
-  absl::Status EditService(const std::string &name, const Service &updates,
-                           const SecureBuffer *credential);
+  // Edits metadata/policy only, then appends changed field revisions.
+  absl::Status EditService(const std::string &name, const Service &updates);
+
+  // Appends a credential-only revision.
+  absl::Status RotateService(const std::string &name, SecureBuffer credential);
 
   absl::Status DeleteService(const std::string &name);
 
   std::vector<std::string> ServiceNames() const;
   const Service *Find(const std::string &name) const;
+  std::vector<VaultHistoryEntry> History(const std::string &name) const;
 
   const std::string &dir() const { return dir_; }
 
 private:
   Vault() = default;
+  friend absl::StatusOr<Vault> OpenInternal(const std::string &dir,
+                                            const std::string &passphrase,
+                                            bool replay);
 
   std::string dir_;
   KdfParams kdf_;
   std::array<std::uint8_t, kSaltBytes> salt_{};
   SecureBuffer key_; // derived key, kept to allow Save() without re-prompting
   std::map<std::string, Service> services_;
+  std::vector<VaultHistoryEntry> history_;
 };
 
 } // namespace prout

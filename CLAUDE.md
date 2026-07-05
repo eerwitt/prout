@@ -46,7 +46,8 @@ CMake locates `clang-format` from `PATH` or the Visual Studio Community LLVM too
 
 ## Current Behavior
 
-- `prout vault init/add/list` manages an encrypted local vault.
+- `prout vault init/add/edit/rotate/delete/list/history/verify` manages an
+  encrypted append-only per-machine vault log set.
 - `prout serve` unlocks the vault, creates the arbiter, listens on `PROUT_SOCKET`, and owns all active leases.
 - `prout run --service ... --intent ... -- <cmd...>` and `prout run --conversation ... --details ...` negotiate only and return safe JSON metadata. The initial run command is stored with that conversation unless denied or timed out.
 - `prout execute --lease <approved-lease-id>` consumes an approved run lease, executes the command stored during `run`, injects the credential into only the child environment for `disclosure=inject` services, and redacts leaked credential bytes in child output. Successful run grants include the injection `env_var` in their safe JSON metadata.
@@ -84,5 +85,5 @@ The parser accepts only the `type` schema. Code clamps TTL and uses to policy ce
 
 ## Roadmap Only
 
-Web UI, sync, Ed25519 signing, HTTP execution/filtering, and curl proxy mode are roadmap items. Do not document them as current behavior unless they are implemented and tested.
+Web UI, Ed25519 signing, HTTP execution/filtering, and curl proxy mode are roadmap items. Do not document them as current behavior unless they are implemented and tested.
 

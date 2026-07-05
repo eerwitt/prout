@@ -1,20 +1,29 @@
 # Prout: Local Credential Leases for Agents
 
-Prout is a local credential-lease daemon for AI agents and automation. An agent states an intent, the local arbiter recommends a short-lived lease, and Prout enforces the vault policy before a credential can be delivered.
+Prout is a local credential lease service for AI agents and automation. An agent states why it needs a specific credential, Prout uses Gemma 4 locally to understand why that credential is required and grant or deny. Prout then provides a temporary lease to execute a command with the credential or in some cases allows exposing the raw credential. All actions are kept in a append only log allowing conflict free sync'ing of the vault across machines.
 
 Credentials are stored in an encrypted vault. The daemon decrypts them into locked memory after unlock and serves local CLI requests over an AF_UNIX socket using length-prefixed JSON frames. Credentials may be disclosed only through active leases, in one of two policy modes:
 
-- `inject`: `prout run` negotiates approval and stores the command to execute, then `prout execute --lease <id>` receives the credential from the daemon and injects it into the child process environment for that stored command. The CLI redacts the credential if the child prints it.
+- `inject`: `prout run` negotiates approval and stores the command to execute, then `prout execute --lease <id>` receives the credential from the daemon and injects it into the child process environment for that stored command. The CLI redacts the credential if the child prints it and filters STDOUT and STDERR for exposed credentials.
 - `reveal`: `prout expose` negotiates approval, then final `prout expose --lease <id>` consumes the approved lease and prints the value for explicit capture.
 
 The model recommends; code enforces. Unknown services, malformed arbiter output, unknown verdicts, zero ceilings, bad disclosure modes, and requests exceeding policy ceilings are denied or rejected before credential release.
+
+## Why?
+
+
 
 ## Current Commands
 
 ```powershell
 prout vault init
 prout vault add <service> --inject-env <VAR> --disclosure inject|reveal --max-ttl <sec> --max-uses <n>
+prout vault edit <service> [metadata/policy flags]
+prout vault rotate <service>
+prout vault delete <service>
 prout vault list
+prout vault history <service>
+prout vault verify
 
 prout serve [--model <path>] [--backend cpu|gpu] [--vault <dir>]
 
@@ -91,8 +100,8 @@ Lease terms are clamped to the service policy ceilings in code.
 - `PROUT_HOME`: vault and audit directory. Defaults to `%LOCALAPPDATA%\prout` on Windows and `~/.prout` elsewhere.
 - `PROUT_SOCKET`: daemon AF_UNIX socket path.
 - `PROUT_PASSPHRASE`: non-interactive vault passphrase for tests and demos.
-- `PROUT_MACHINE`: machine id used for `audit-<machine>.jsonl`.
-- `PROUT_CREDENTIAL`: non-interactive credential input for `vault add`.
+- `PROUT_MACHINE`: machine id used for `audit-<machine>.jsonl` and `vault-<machine>.jsonl`.
+- `PROUT_CREDENTIAL`: non-interactive credential input for `vault add` and `vault rotate`.
 
 ## Build
 
@@ -114,6 +123,10 @@ The Windows build stages `dist/prout.exe`, `litert-lm.dll`, and the LiteRT-LM co
 
 Each machine appends only to its own `audit-<machine>.jsonl` file. Records are hash-chained and contain safe metadata: conversation ids, intent/details, service, verdict, rationale, lease terms, disclosure mode, command summaries, child exit codes, and redaction flags. Credential values and raw command output are never written to audit records. `prout audit conversation <id>` shows one conversation newest first, and `prout audit verify` recomputes the chain and detects manual record corruption.
 
+## Vault Log
+
+Each machine appends vault mutations to its own encrypted `vault-<machine>.jsonl` file. Syncing a vault directory is a file union: Prout verifies every hash chain, decrypts records with the vault passphrase, and replays metadata, policy, credential rotations, and tombstones into the effective service state. `vault history` shows safe revision metadata only; credential values stay encrypted except during authorized lease delivery.
+
 ## Security Invariants
 
 1. Credentials never leave locked memory except across the local IPC/CLI boundary for an authorized lease delivery, and never into logs, audit records, errors, or normal `run` output.
@@ -124,5 +137,5 @@ Each machine appends only to its own `audit-<machine>.jsonl` file. Records are h
 
 ## Roadmap
 
-Web vault management, sync, Ed25519-signed records, and curl proxy/request execution modes are roadmap items. They are not part of the current implemented surface.
+Web vault management, Ed25519-signed records, and curl proxy/request execution modes are roadmap items. They are not part of the current implemented surface.
 

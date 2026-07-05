@@ -27,9 +27,11 @@ void VaultUsage() {
       "--company <name> --details <text> [--disclosure inject|reveal] "
       "[--max-ttl <sec>] [--max-uses <n>] [--description <text>] "
       "[--guidance <text>] [--expires-at <utc>] [--generate]\n"
-      "  prout vault edit <service> [same metadata/policy flags] "
-      "[--credential] [--generate]\n"
+      "  prout vault edit <service> [same metadata/policy flags]\n"
+      "  prout vault rotate <service> [--generate]\n"
       "  prout vault delete <service>\n"
+      "  prout vault history <service>\n"
+      "  prout vault verify\n"
       "  prout vault list [--vault <dir>]\n"
       "  prout vault generate [--length <n>] [--lower] [--upper] [--digits] "
       "[--symbols] [--no-ambiguous]\n");
@@ -154,6 +156,16 @@ std::string MetadataSummary(const Service &s) {
   return "inject_env=" + s.inject_env +
          " disclosure=" + DisclosureName(s.disclosure) +
          " website_host=" + s.website_host + " company=" + s.company;
+}
+
+std::string JoinFields(const std::vector<std::string> &fields) {
+  std::string out;
+  for (const auto &field : fields) {
+    if (!out.empty())
+      out += ",";
+    out += field;
+  }
+  return out;
 }
 
 std::string Advice(const Args &a, const std::string &action, const Service *s) {
@@ -335,6 +347,11 @@ int CmdVault(const std::vector<std::string> &argv) {
       VaultUsage();
       return kExitError;
     }
+    if (a.Has("credential") || a.Has("generate")) {
+      std::fprintf(stderr, "prout: use 'vault rotate <service>' to change a "
+                           "credential\n");
+      return kExitError;
+    }
     auto vault = OpenVault(a);
     if (!vault.ok()) {
       std::fprintf(stderr, "prout: %s\n",
@@ -353,20 +370,8 @@ int CmdVault(const std::vector<std::string> &argv) {
     }
     Service edited = EditableCopy(*existing);
     ApplyEditFlags(a, &edited);
-    SecureBuffer new_cred;
-    SecureBuffer *cred_ptr = nullptr;
-    if (a.Has("credential") || a.Has("generate")) {
-      auto cred = CaptureCredential(a);
-      if (!cred.ok()) {
-        std::fprintf(stderr, "prout: %s\n",
-                     std::string(cred.status().message()).c_str());
-        return kExitError;
-      }
-      new_cred = std::move(*cred);
-      cred_ptr = &new_cred;
-    }
     std::string advice = Advice(a, "edit", &edited);
-    auto st = vault->EditService(edited.name, edited, cred_ptr);
+    auto st = vault->EditService(edited.name, edited);
     if (!st.ok()) {
       std::fprintf(stderr, "prout: %s\n", std::string(st.message()).c_str());
       return kExitError;
@@ -374,6 +379,37 @@ int CmdVault(const std::vector<std::string> &argv) {
     AuditVaultMutation(dir, "edit", edited.name, MetadataSummary(edited),
                        advice);
     std::fprintf(stdout, "edited service %s\n", edited.name.c_str());
+    return kExitOk;
+  }
+
+  if (sub == "rotate") {
+    if (a.positional.empty()) {
+      VaultUsage();
+      return kExitError;
+    }
+    auto cred = CaptureCredential(a);
+    if (!cred.ok()) {
+      std::fprintf(stderr, "prout: %s\n",
+                   std::string(cred.status().message()).c_str());
+      return kExitError;
+    }
+    auto vault = OpenVault(a);
+    if (!vault.ok()) {
+      std::fprintf(stderr, "prout: %s\n",
+                   std::string(vault.status().message()).c_str());
+      return kExitError;
+    }
+    const Service *existing = vault->Find(a.positional[0]);
+    std::string summary =
+        existing ? MetadataSummary(*existing) : "unknown service";
+    std::string advice = Advice(a, "rotate", existing);
+    auto st = vault->RotateService(a.positional[0], std::move(*cred));
+    if (!st.ok()) {
+      std::fprintf(stderr, "prout: %s\n", std::string(st.message()).c_str());
+      return kExitError;
+    }
+    AuditVaultMutation(dir, "rotate", a.positional[0], summary, advice);
+    std::fprintf(stdout, "rotated service %s\n", a.positional[0].c_str());
     return kExitOk;
   }
 
@@ -399,6 +435,44 @@ int CmdVault(const std::vector<std::string> &argv) {
     }
     AuditVaultMutation(dir, "delete", a.positional[0], summary, advice);
     std::fprintf(stdout, "deleted service %s\n", a.positional[0].c_str());
+    return kExitOk;
+  }
+
+  if (sub == "history") {
+    if (a.positional.empty()) {
+      VaultUsage();
+      return kExitError;
+    }
+    auto vault = OpenVault(a);
+    if (!vault.ok()) {
+      std::fprintf(stderr, "prout: %s\n",
+                   std::string(vault.status().message()).c_str());
+      return kExitError;
+    }
+    auto history = vault->History(a.positional[0]);
+    if (history.empty()) {
+      std::fprintf(stderr, "prout: no history for service '%s'\n",
+                   a.positional[0].c_str());
+      return kExitError;
+    }
+    for (const auto &h : history) {
+      std::fprintf(stdout, "%s\t%s\t%s\t%s\t%s\tfields=%s\trevision=%s\n",
+                   h.timestamp.c_str(), h.machine.c_str(), h.action.c_str(),
+                   h.active ? "active" : "superseded", h.service.c_str(),
+                   JoinFields(h.fields).c_str(), h.revision_id.c_str());
+    }
+    return kExitOk;
+  }
+
+  if (sub == "verify") {
+    std::string pass = ReadPassphrase("Vault passphrase: ");
+    auto st = Vault::Verify(dir, pass);
+    SecureZero(pass.data(), pass.size());
+    if (!st.ok()) {
+      std::fprintf(stderr, "prout: %s\n", std::string(st.message()).c_str());
+      return kExitError;
+    }
+    std::fprintf(stdout, "vault logs verified\n");
     return kExitOk;
   }
 

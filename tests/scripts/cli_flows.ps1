@@ -43,6 +43,12 @@ function Invoke-Prout {
   return [pscustomobject]@{ Code = $p.ExitCode; Out = $p.StandardOutput.ReadToEnd(); Err = $p.StandardError.ReadToEnd() }
 }
 
+function Sync-VaultLogs([string]$From, [string]$To) {
+  Get-ChildItem -Path $From -Filter 'vault-*.jsonl' | ForEach-Object {
+    Copy-Item -Path $_.FullName -Destination (Join-Path $To $_.Name) -Force
+  }
+}
+
 try {
   $r = Invoke-Prout -ArgList @('vault', 'init')
   if ($r.Code -ne 0) { Fail "vault init failed: $($r.Err)" }
@@ -62,6 +68,20 @@ try {
 
   $r = Invoke-Prout -ArgList @('vault', 'edit', 'github/personal', '--company', 'Example API Edited', '--details', 'edited local integration fixture token')
   if ($r.Code -ne 0) { Fail "vault edit failed: $($r.Err)" }
+
+  $env:PROUT_CREDENTIAL = 'rotate-secret-one'
+  $r = Invoke-Prout -ArgList @('vault', 'add', 'rotate-fixture', '--inject-env', 'ROTATE_TOKEN', '--website', 'https://rotate.example.test', '--company', 'Rotate Example', '--details', 'rotation fixture', '--description', 'rotation fixture')
+  if ($r.Code -ne 0) { Fail "vault add rotate fixture failed: $($r.Err)" }
+  $env:PROUT_CREDENTIAL = 'rotated-inject-secret'
+  $r = Invoke-Prout -ArgList @('vault', 'rotate', 'rotate-fixture')
+  if ($r.Code -ne 0) { Fail "vault rotate failed: $($r.Err)" }
+  $env:PROUT_CREDENTIAL = ''
+  $r = Invoke-Prout -ArgList @('vault', 'history', 'rotate-fixture')
+  if ($r.Code -ne 0) { Fail "vault history failed: $($r.Err)" }
+  if (($r.Out + $r.Err).Contains('rotated-inject-secret')) { Fail 'vault history leaked a rotated credential' }
+  if (-not $r.Out.Contains('rotate')) { Fail "vault history did not show rotation: $($r.Out)" }
+  $r = Invoke-Prout -ArgList @('vault', 'verify')
+  if ($r.Code -ne 0) { Fail "vault verify failed: $($r.Err)" }
 
   $env:PROUT_CREDENTIAL = 'delete-secret'
   $r = Invoke-Prout -ArgList @('vault', 'add', 'aws:prod/admin', '--inject-env', 'DELETE_TOKEN', '--website', 'https://delete.example.test', '--company', 'Delete Example', '--details', 'temporary delete fixture', '--description', 'delete fixture')
@@ -168,10 +188,72 @@ try {
   $r = Invoke-Prout -ArgList @('audit', 'verify')
   if ($r.Code -eq 0) { Fail 'audit verify did not detect manual corruption' }
 
+  $syncA = Join-Path $root 'sync-a'
+  $syncB = Join-Path $root 'sync-b'
+  New-Item -ItemType Directory -Force -Path $syncA, $syncB | Out-Null
+  $oldHome = $env:PROUT_HOME
+  $oldMachine = $env:PROUT_MACHINE
+  try {
+    $env:PROUT_HOME = $syncA
+    $env:PROUT_MACHINE = 'sync-a'
+    $r = Invoke-Prout -ArgList @('vault', 'init')
+    if ($r.Code -ne 0) { Fail "sync vault init failed: $($r.Err)" }
+    $env:PROUT_CREDENTIAL = 'sync-secret-a'
+    $r = Invoke-Prout -ArgList @('vault', 'add', 'shared', '--inject-env', 'SYNC_TOKEN', '--website', 'https://sync.example.test', '--company', 'SyncCo', '--details', 'base details', '--description', 'sync fixture')
+    if ($r.Code -ne 0) { Fail "sync add shared failed: $($r.Err)" }
+    $env:PROUT_CREDENTIAL = 'only-a-secret'
+    $r = Invoke-Prout -ArgList @('vault', 'add', 'only-a', '--inject-env', 'ONLY_A_TOKEN', '--website', 'https://a.example.test', '--company', 'A', '--details', 'a details', '--description', 'a fixture')
+    if ($r.Code -ne 0) { Fail "sync add only-a failed: $($r.Err)" }
+    Sync-VaultLogs $syncA $syncB
+
+    $env:PROUT_HOME = $syncB
+    $env:PROUT_MACHINE = 'sync-b'
+    $env:PROUT_CREDENTIAL = 'only-b-secret'
+    $r = Invoke-Prout -ArgList @('vault', 'add', 'only-b', '--inject-env', 'ONLY_B_TOKEN', '--website', 'https://b.example.test', '--company', 'B', '--details', 'b details', '--description', 'b fixture')
+    if ($r.Code -ne 0) { Fail "sync add only-b failed: $($r.Err)" }
+    $r = Invoke-Prout -ArgList @('vault', 'edit', 'shared', '--details', 'details from b')
+    if ($r.Code -ne 0) { Fail "sync edit details failed: $($r.Err)" }
+    $env:PROUT_CREDENTIAL = 'sync-secret-b'
+    $r = Invoke-Prout -ArgList @('vault', 'rotate', 'shared')
+    if ($r.Code -ne 0) { Fail "sync rotate shared failed: $($r.Err)" }
+
+    $env:PROUT_HOME = $syncA
+    $env:PROUT_MACHINE = 'sync-a'
+    $r = Invoke-Prout -ArgList @('vault', 'edit', 'shared', '--company', 'SyncCo A')
+    if ($r.Code -ne 0) { Fail "sync edit company failed: $($r.Err)" }
+
+    Sync-VaultLogs $syncA $syncB
+    Sync-VaultLogs $syncB $syncA
+    $r = Invoke-Prout -ArgList @('vault', 'list')
+    if ($r.Code -ne 0) { Fail "sync merged list failed: $($r.Err)" }
+    if (-not $r.Out.Contains('only-a') -or -not $r.Out.Contains('only-b')) { Fail "sync union lost a service: $($r.Out)" }
+    if (-not $r.Out.Contains('SyncCo A')) { Fail "sync merge lost company edit: $($r.Out)" }
+    $r = Invoke-Prout -ArgList @('vault', 'history', 'shared')
+    if ($r.Code -ne 0) { Fail "sync history failed: $($r.Err)" }
+    if (($r.Out + $r.Err).Contains('sync-secret-a') -or ($r.Out + $r.Err).Contains('sync-secret-b')) { Fail 'sync history leaked credential bytes' }
+    if (-not $r.Out.Contains('rotate')) { Fail "sync history omitted credential rotation: $($r.Out)" }
+    $r = Invoke-Prout -ArgList @('vault', 'verify')
+    if ($r.Code -ne 0) { Fail "sync vault verify failed: $($r.Err)" }
+
+    $vaultFile = Join-Path $syncA 'vault-sync-a.jsonl'
+    $vaultText = Get-Content -Raw -Path $vaultFile
+    $vaultText = $vaultText -replace 'mutation', 'mutated'
+    Set-Content -Path $vaultFile -Value $vaultText -NoNewline
+    $r = Invoke-Prout -ArgList @('vault', 'verify')
+    if ($r.Code -eq 0) { Fail 'vault verify did not detect manual corruption' }
+  } finally {
+    $env:PROUT_HOME = $oldHome
+    $env:PROUT_MACHINE = $oldMachine
+    $env:PROUT_CREDENTIAL = ''
+  }
+
   Write-Host 'prout CLI flow tests passed'
 } finally {
   if ($daemon -and -not $daemon.HasExited) {
-    try { $daemon.Kill() } catch {}
+    try {
+      $daemon.Kill()
+      $daemon.WaitForExit(5000) | Out-Null
+    } catch {}
   }
 }
 

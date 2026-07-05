@@ -3,9 +3,13 @@
 #include <algorithm>
 #include <chrono>
 #include <cctype>
+#include <cstdio>
+#include <cstdint>
+#include <cstdlib>
 #include <ctime>
 #include <filesystem>
 #include <fstream>
+#include <map>
 #include <sstream>
 
 #include "common/paths.h"
@@ -28,11 +32,43 @@ absl::StatusOr<Disclosure> ParseDisclosure(const std::string &s) {
 }
 
 namespace {
-constexpr int kBodySchemaVersion = 2;
+constexpr int kLogSchemaVersion = 1;
+constexpr int kPayloadSchemaVersion = 1;
 
-std::string VaultFile(const std::string &dir) {
-  return (fs::path(dir) / "vault.json").string();
-}
+struct Mutation {
+  std::string revision_id;
+  std::string machine;
+  std::string ts;
+  std::uint64_t seq = 0;
+  std::string action;
+  std::string service;
+  std::map<std::string, std::string> fields;
+  SecureBuffer credential;
+  bool has_credential = false;
+};
+
+struct FieldRevision {
+  std::string value;
+  std::string revision_id;
+  std::string machine;
+  std::string ts;
+  std::string sort_key;
+};
+
+struct ServiceReplay {
+  std::string name;
+  std::string add_key;
+  std::string delete_key;
+  std::map<std::string, FieldRevision> fields;
+  FieldRevision credential;
+  bool has_credential = false;
+  std::vector<std::string> update_timestamps;
+};
+
+struct ReplayedVault {
+  std::map<std::string, Service> services;
+  std::vector<VaultHistoryEntry> history;
+};
 
 std::string NowIso8601() {
   auto now = std::chrono::system_clock::now();
@@ -48,98 +84,31 @@ std::string NowIso8601() {
   return buf;
 }
 
-absl::StatusOr<std::string> ReadFile(const std::string &path) {
-  std::ifstream f(path, std::ios::binary);
-  if (!f)
-    return absl::NotFoundError("cannot open " + path);
-  std::ostringstream ss;
-  ss << f.rdbuf();
-  return ss.str();
+std::string MachineVaultFile(const std::string &dir,
+                             const std::string &machine) {
+  return (fs::path(dir) / ("vault-" + machine + ".jsonl")).string();
 }
 
-absl::Status WriteFileAtomic(const std::string &path, const std::string &data) {
-  std::string tmp = path + ".tmp";
-  {
-    std::ofstream f(tmp, std::ios::binary | std::ios::trunc);
-    if (!f)
-      return absl::InternalError("cannot write " + tmp);
-    f.write(data.data(), static_cast<std::streamsize>(data.size()));
-    if (!f)
-      return absl::InternalError("write failed for " + tmp);
-  }
-  std::error_code ec;
-  fs::rename(tmp, path, ec);
-  if (ec) {
-    fs::remove(path, ec);
-    fs::rename(tmp, path, ec);
-  }
-  if (ec)
-    return absl::InternalError("atomic replace failed: " + ec.message());
-  return absl::OkStatus();
+std::string RevisionId(const std::string &machine, const std::string &ts) {
+  std::uint8_t bytes[16]{};
+  if (!RandomBytes(bytes, sizeof(bytes)).ok())
+    return machine + "-" + ts + "-random-failed";
+  return machine + "-" + ts + "-" + ToHex(bytes, sizeof(bytes));
 }
 
-std::string RequiredString(const json &j, const char *field,
-                           const std::string &service) {
-  if (!j.contains(field) || !j[field].is_string())
-    throw std::runtime_error("service '" + service +
-                             "' missing required field '" + field + "'");
-  return j[field].get<std::string>();
+std::string SortKey(const Mutation &m) {
+  char seq[32];
+  std::snprintf(seq, sizeof(seq), "%020llu",
+                static_cast<unsigned long long>(m.seq));
+  return m.ts + "|" + m.machine + "|" + seq + "|" + m.revision_id;
 }
 
-std::uint32_t RequiredU32(const json &j, const char *field,
-                          const std::string &service) {
-  if (!j.contains(field) || !j[field].is_number_unsigned())
-    throw std::runtime_error("service '" + service +
-                             "' missing required field '" + field + "'");
-  return j[field].get<std::uint32_t>();
+std::string Canonical(const nlohmann::ordered_json &rec) {
+  nlohmann::ordered_json copy = rec;
+  copy.erase("hash");
+  return copy.dump();
 }
 
-std::string SerializeBody(const std::map<std::string, Service> &services) {
-  json body;
-  body["schema_version"] = kBodySchemaVersion;
-  json svc = json::object();
-  for (const auto &[name, s] : services) {
-    json j;
-    j["name"] = s.name;
-    j["inject_env"] = s.inject_env;
-    j["disclosure"] = DisclosureName(s.disclosure);
-    j["policy"] = {{"max_ttl_seconds", s.policy.max_ttl_seconds},
-                   {"max_uses", s.policy.max_uses},
-                   {"description", s.policy.description},
-                   {"guidance", s.policy.guidance}};
-    j["website_url"] = s.website_url;
-    j["website_host"] = s.website_host;
-    j["company"] = s.company;
-    j["details"] = s.details;
-    j["expires_at"] = s.expires_at;
-    j["created_at"] = s.created_at;
-    j["updated_at"] = s.updated_at;
-    j["update_timestamps"] = s.update_timestamps;
-    j["credential"] =
-        std::string(reinterpret_cast<const char *>(s.credential.data()),
-                    s.credential.size());
-    svc[name] = std::move(j);
-  }
-  body["services"] = std::move(svc);
-  return body.dump();
-}
-
-Service CopyServiceMetadata(const Service &s) {
-  Service out;
-  out.name = s.name;
-  out.inject_env = s.inject_env;
-  out.disclosure = s.disclosure;
-  out.policy = s.policy;
-  out.website_url = s.website_url;
-  out.website_host = s.website_host;
-  out.company = s.company;
-  out.details = s.details;
-  out.expires_at = s.expires_at;
-  out.created_at = s.created_at;
-  out.updated_at = s.updated_at;
-  out.update_timestamps = s.update_timestamps;
-  return out;
-}
 absl::Status ValidateService(const Service &s) {
   if (s.name.empty())
     return absl::InvalidArgumentError("service name is required");
@@ -158,15 +127,470 @@ absl::Status ValidateService(const Service &s) {
   return absl::OkStatus();
 }
 
+std::map<std::string, std::string> ServiceFields(const Service &s) {
+  return {{"inject_env", s.inject_env},
+          {"disclosure", DisclosureName(s.disclosure)},
+          {"policy.max_ttl_seconds", std::to_string(s.policy.max_ttl_seconds)},
+          {"policy.max_uses", std::to_string(s.policy.max_uses)},
+          {"policy.description", s.policy.description},
+          {"policy.guidance", s.policy.guidance},
+          {"website_url", s.website_url},
+          {"website_host", s.website_host},
+          {"company", s.company},
+          {"details", s.details},
+          {"expires_at", s.expires_at}};
+}
+
+std::uint32_t ParseStoredU32(const std::string &s, const std::string &field,
+                             const std::string &service) {
+  char *end = nullptr;
+  unsigned long v = std::strtoul(s.c_str(), &end, 10);
+  if (end == s.c_str() || *end != '\0')
+    throw std::runtime_error("service '" + service + "' has bad " + field);
+  return static_cast<std::uint32_t>(v);
+}
+
+std::string RequiredField(const ServiceReplay &r, const std::string &field) {
+  auto it = r.fields.find(field);
+  if (it == r.fields.end())
+    throw std::runtime_error("service '" + r.name + "' missing " + field);
+  return it->second.value;
+}
+
+absl::StatusOr<Service> BuildService(const ServiceReplay &r) {
+  try {
+    Service s;
+    s.name = r.name;
+    s.inject_env = RequiredField(r, "inject_env");
+    auto disc = ParseDisclosure(RequiredField(r, "disclosure"));
+    if (!disc.ok())
+      return disc.status();
+    s.disclosure = *disc;
+    s.policy.max_ttl_seconds =
+        ParseStoredU32(RequiredField(r, "policy.max_ttl_seconds"),
+                       "policy.max_ttl_seconds", r.name);
+    s.policy.max_uses = ParseStoredU32(RequiredField(r, "policy.max_uses"),
+                                       "policy.max_uses", r.name);
+    s.policy.description = RequiredField(r, "policy.description");
+    s.policy.guidance = RequiredField(r, "policy.guidance");
+    s.website_url = RequiredField(r, "website_url");
+    s.website_host = RequiredField(r, "website_host");
+    s.company = RequiredField(r, "company");
+    s.details = RequiredField(r, "details");
+    s.expires_at = RequiredField(r, "expires_at");
+    s.created_at = r.add_key.substr(0, r.add_key.find('|'));
+    s.updated_at =
+        r.update_timestamps.empty() ? s.created_at : r.update_timestamps.back();
+    s.update_timestamps = r.update_timestamps;
+    s.credential.assign(r.credential.value);
+    auto valid = ValidateService(s);
+    if (!valid.ok())
+      return valid;
+    return s;
+  } catch (const std::exception &e) {
+    return absl::DataLossError(e.what());
+  }
+}
+
+std::vector<std::string> VaultLogPaths(const std::string &dir) {
+  std::vector<std::string> paths;
+  std::error_code ec;
+  if (!fs::exists(dir, ec))
+    return paths;
+  for (const auto &entry : fs::directory_iterator(dir, ec)) {
+    if (ec)
+      break;
+    if (!entry.is_regular_file())
+      continue;
+    std::string name = entry.path().filename().string();
+    if (name.rfind("vault-", 0) == 0 && entry.path().extension() == ".jsonl")
+      paths.push_back(entry.path().string());
+  }
+  std::sort(paths.begin(), paths.end());
+  return paths;
+}
+
+absl::Status ReadKdfFromHeader(const nlohmann::ordered_json &j, KdfParams *kdf,
+                               std::array<std::uint8_t, kSaltBytes> *salt) {
+  if (!j.contains("kdf") || !j["kdf"].is_object())
+    return absl::DataLossError("vault header missing kdf");
+  const auto &jkdf = j["kdf"];
+  kdf->nb_blocks = jkdf.value("nb_blocks", 65536u);
+  kdf->nb_passes = jkdf.value("nb_passes", 3u);
+  kdf->nb_lanes = jkdf.value("nb_lanes", 1u);
+  auto raw_salt = FromHex(jkdf.at("salt").get<std::string>());
+  if (!raw_salt.ok())
+    return raw_salt.status();
+  if (raw_salt->size() != kSaltBytes)
+    return absl::DataLossError("bad salt length");
+  std::copy(raw_salt->begin(), raw_salt->end(), salt->begin());
+  return absl::OkStatus();
+}
+
+absl::Status VerifyOneLog(const std::string &path, KdfParams *kdf,
+                          std::array<std::uint8_t, kSaltBytes> *salt,
+                          bool *have_kdf,
+                          std::vector<nlohmann::ordered_json> *records) {
+  std::ifstream f(path);
+  if (!f)
+    return absl::InternalError("cannot open " + path);
+  std::string line;
+  std::string prev = "GENESIS";
+  int lineno = 0;
+  bool saw_header = false;
+  while (std::getline(f, line)) {
+    if (line.empty())
+      continue;
+    ++lineno;
+    nlohmann::ordered_json j =
+        nlohmann::ordered_json::parse(line, nullptr, false);
+    if (j.is_discarded())
+      return absl::DataLossError(path + ": record " + std::to_string(lineno) +
+                                 " is not valid JSON");
+    if (j.value("prev_hash", "") != prev)
+      return absl::DataLossError(path + ": chain break at record " +
+                                 std::to_string(lineno));
+    std::string want = Blake2bHex(prev, Canonical(j));
+    if (j.value("hash", "") != want)
+      return absl::DataLossError(path + ": tampered record at line " +
+                                 std::to_string(lineno));
+    if (lineno == 1) {
+      if (j.value("type", "") != "header")
+        return absl::DataLossError(path + ": first record is not a header");
+      KdfParams parsed_kdf;
+      std::array<std::uint8_t, kSaltBytes> parsed_salt{};
+      auto st = ReadKdfFromHeader(j, &parsed_kdf, &parsed_salt);
+      if (!st.ok())
+        return st;
+      if (*have_kdf) {
+        if (parsed_kdf.nb_blocks != kdf->nb_blocks ||
+            parsed_kdf.nb_passes != kdf->nb_passes ||
+            parsed_kdf.nb_lanes != kdf->nb_lanes ||
+            !std::equal(parsed_salt.begin(), parsed_salt.end(),
+                        salt->begin())) {
+          return absl::DataLossError(path + ": vault header does not match");
+        }
+      } else {
+        *kdf = parsed_kdf;
+        *salt = parsed_salt;
+      }
+      *have_kdf = true;
+      saw_header = true;
+    } else if (j.value("type", "") == "header") {
+      return absl::DataLossError(path + ": duplicate header");
+    }
+    prev = j.value("hash", "");
+    records->push_back(std::move(j));
+  }
+  if (!saw_header)
+    return absl::DataLossError(path + ": empty vault log");
+  return absl::OkStatus();
+}
+
+absl::StatusOr<Mutation> DecryptMutation(const SecureBuffer &key,
+                                         const nlohmann::ordered_json &rec) {
+  Mutation m;
+  m.machine = rec.value("machine", "");
+  m.ts = rec.value("ts", "");
+  m.seq = rec.value("seq", 0ull);
+  auto blob = FromHex(rec.at("payload").get<std::string>());
+  if (!blob.ok())
+    return blob.status();
+  auto plain = AeadOpen(key, blob->data(), blob->size());
+  if (!plain.ok())
+    return plain.status();
+  std::string raw(reinterpret_cast<const char *>(plain->data()), plain->size());
+  json payload = json::parse(raw, nullptr, false);
+  SecureZero(raw.data(), raw.size());
+  if (payload.is_discarded())
+    return absl::DataLossError("vault mutation payload is not JSON");
+  if (payload.value("schema_version", 0) != kPayloadSchemaVersion)
+    return absl::DataLossError("unsupported vault mutation schema");
+  m.revision_id = payload.at("revision_id").get<std::string>();
+  m.machine = payload.value("machine", m.machine);
+  m.ts = payload.value("ts", m.ts);
+  m.action = payload.at("action").get<std::string>();
+  m.service = payload.at("service").get<std::string>();
+  if (payload.contains("fields")) {
+    for (const auto &[k, v] : payload["fields"].items())
+      m.fields[k] = v.get<std::string>();
+  }
+  if (payload.contains("credential_hex")) {
+    auto cred = FromHex(payload["credential_hex"].get<std::string>());
+    if (!cred.ok())
+      return cred.status();
+    m.credential.assign(cred->data(), cred->size());
+    SecureZero(cred->data(), cred->size());
+    m.has_credential = true;
+  }
+  return m;
+}
+
+absl::StatusOr<std::vector<Mutation>>
+ReadMutations(const std::string &dir, const SecureBuffer &key, KdfParams *kdf,
+              std::array<std::uint8_t, kSaltBytes> *salt) {
+  auto paths = VaultLogPaths(dir);
+  if (paths.empty())
+    return absl::NotFoundError("vault is not initialized in " + dir);
+  bool have_kdf = false;
+  std::vector<nlohmann::ordered_json> records;
+  for (const auto &path : paths) {
+    auto st = VerifyOneLog(path, kdf, salt, &have_kdf, &records);
+    if (!st.ok())
+      return st;
+  }
+  std::vector<Mutation> out;
+  for (const auto &rec : records) {
+    if (rec.value("type", "") != "mutation")
+      continue;
+    auto m = DecryptMutation(key, rec);
+    if (!m.ok())
+      return m.status();
+    out.push_back(std::move(*m));
+  }
+  return out;
+}
+
+absl::Status AppendHeader(const std::string &dir, const KdfParams &kdf,
+                          const std::array<std::uint8_t, kSaltBytes> &salt) {
+  nlohmann::ordered_json rec;
+  rec["schema_version"] = kLogSchemaVersion;
+  rec["type"] = "header";
+  rec["ts"] = NowIso8601();
+  rec["machine"] = MachineId();
+  rec["kdf"] = {{"salt", ToHex(salt.data(), salt.size())},
+                {"nb_blocks", kdf.nb_blocks},
+                {"nb_passes", kdf.nb_passes},
+                {"nb_lanes", kdf.nb_lanes}};
+  rec["prev_hash"] = "GENESIS";
+  rec["hash"] = Blake2bHex("GENESIS", Canonical(rec));
+  std::ofstream f(MachineVaultFile(dir, MachineId()), std::ios::app);
+  if (!f)
+    return absl::InternalError("cannot write vault log");
+  f << rec.dump() << "\n";
+  if (!f)
+    return absl::InternalError("vault header write failed");
+  return absl::OkStatus();
+}
+
+absl::Status AppendMutation(const std::string &dir, const SecureBuffer &key,
+                            const KdfParams &kdf,
+                            const std::array<std::uint8_t, kSaltBytes> &salt,
+                            Mutation m) {
+  if (!EnsureDir(dir))
+    return absl::InternalError("cannot create " + dir);
+  const std::string path = MachineVaultFile(dir, MachineId());
+  if (!fs::exists(path)) {
+    auto st = AppendHeader(dir, kdf, salt);
+    if (!st.ok())
+      return st;
+  }
+
+  std::string prev = "GENESIS";
+  std::uint64_t seq = 0;
+  {
+    std::ifstream f(path);
+    std::string line, last;
+    while (std::getline(f, line)) {
+      if (!line.empty()) {
+        last = line;
+        ++seq;
+      }
+    }
+    if (!last.empty()) {
+      json j = json::parse(last, nullptr, false);
+      if (!j.is_discarded() && j.contains("hash"))
+        prev = j["hash"].get<std::string>();
+    }
+  }
+
+  json payload;
+  payload["schema_version"] = kPayloadSchemaVersion;
+  payload["revision_id"] = m.revision_id;
+  payload["machine"] = m.machine;
+  payload["ts"] = m.ts;
+  payload["action"] = m.action;
+  payload["service"] = m.service;
+  payload["fields"] = m.fields;
+  if (m.has_credential) {
+    payload["credential_hex"] = ToHex(m.credential.data(), m.credential.size());
+  }
+  std::string plain = payload.dump();
+  auto blob = AeadSeal(
+      key, reinterpret_cast<const std::uint8_t *>(plain.data()), plain.size());
+  SecureZero(plain.data(), plain.size());
+  if (!blob.ok())
+    return blob.status();
+
+  nlohmann::ordered_json rec;
+  rec["schema_version"] = kLogSchemaVersion;
+  rec["type"] = "mutation";
+  rec["ts"] = m.ts;
+  rec["machine"] = m.machine;
+  rec["seq"] = seq;
+  rec["payload"] = ToHex(blob->data(), blob->size());
+  rec["prev_hash"] = prev;
+  rec["hash"] = Blake2bHex(prev, Canonical(rec));
+  SecureZero(blob->data(), blob->size());
+
+  std::ofstream f(path, std::ios::app);
+  if (!f)
+    return absl::InternalError("cannot append to " + path);
+  f << rec.dump() << "\n";
+  if (!f)
+    return absl::InternalError("vault append write failed");
+  return absl::OkStatus();
+}
+
+void ApplyRevision(ServiceReplay *r, const Mutation &m) {
+  const std::string key = SortKey(m);
+  if (m.action == "add") {
+    if (key > r->add_key) {
+      r->add_key = key;
+      r->fields.clear();
+      r->has_credential = false;
+      r->update_timestamps.clear();
+    }
+  } else if (m.action == "delete") {
+    if (key > r->delete_key)
+      r->delete_key = key;
+    return;
+  }
+
+  if (r->add_key.empty() || key < r->add_key || key <= r->delete_key)
+    return;
+  for (const auto &[field, value] : m.fields) {
+    auto it = r->fields.find(field);
+    if (it == r->fields.end() || key > it->second.sort_key) {
+      r->fields[field] = FieldRevision{.value = value,
+                                       .revision_id = m.revision_id,
+                                       .machine = m.machine,
+                                       .ts = m.ts,
+                                       .sort_key = key};
+    }
+  }
+  if (m.has_credential &&
+      (!r->has_credential || key > r->credential.sort_key)) {
+    std::string cred(reinterpret_cast<const char *>(m.credential.data()),
+                     m.credential.size());
+    r->credential = FieldRevision{.value = cred,
+                                  .revision_id = m.revision_id,
+                                  .machine = m.machine,
+                                  .ts = m.ts,
+                                  .sort_key = key};
+    SecureZero(cred.data(), cred.size());
+    r->has_credential = true;
+  }
+  r->update_timestamps.push_back(m.ts);
+}
+
+bool MutationActive(const std::map<std::string, ServiceReplay> &states,
+                    const Mutation &m) {
+  auto it = states.find(m.service);
+  if (it == states.end())
+    return false;
+  const ServiceReplay &r = it->second;
+  const std::string key = SortKey(m);
+  if (m.action == "delete")
+    return key == r.delete_key && key > r.add_key;
+  if (key <= r.delete_key || key < r.add_key)
+    return false;
+  if (m.action == "add")
+    return key == r.add_key;
+  if (m.action == "rotate")
+    return r.has_credential && key == r.credential.sort_key;
+  for (const auto &[field, _] : m.fields) {
+    auto fit = r.fields.find(field);
+    if (fit != r.fields.end() && fit->second.sort_key == key)
+      return true;
+  }
+  return false;
+}
+
+absl::StatusOr<ReplayedVault> Replay(std::vector<Mutation> mutations) {
+  ReplayedVault out;
+  std::sort(mutations.begin(), mutations.end(),
+            [](const Mutation &a, const Mutation &b) {
+              return SortKey(a) < SortKey(b);
+            });
+  std::map<std::string, ServiceReplay> states;
+  for (const Mutation &m : mutations) {
+    auto &state = states[m.service];
+    state.name = m.service;
+    ApplyRevision(&state, m);
+  }
+
+  for (const auto &[name, state] : states) {
+    if (state.add_key.empty() || state.delete_key > state.add_key ||
+        !state.has_credential)
+      continue;
+    auto svc = BuildService(state);
+    if (!svc.ok())
+      return svc.status();
+    out.services.emplace(name, std::move(*svc));
+  }
+
+  for (const Mutation &m : mutations) {
+    VaultHistoryEntry h;
+    h.revision_id = m.revision_id;
+    h.machine = m.machine;
+    h.timestamp = m.ts;
+    h.action = m.action;
+    h.service = m.service;
+    for (const auto &[field, _] : m.fields)
+      h.fields.push_back(field);
+    if (m.has_credential)
+      h.fields.push_back("credential");
+    h.active = MutationActive(states, m);
+    out.history.push_back(std::move(h));
+  }
+  return out;
+}
+
 } // namespace
+
+absl::StatusOr<Vault> OpenInternal(const std::string &dir,
+                                   const std::string &passphrase, bool replay) {
+  auto paths = VaultLogPaths(dir);
+  if (paths.empty())
+    return absl::NotFoundError("vault is not initialized in " + dir);
+
+  Vault v;
+  v.dir_ = dir;
+  bool have_kdf = false;
+  std::vector<nlohmann::ordered_json> unused;
+  for (const auto &path : paths) {
+    auto st = VerifyOneLog(path, &v.kdf_, &v.salt_, &have_kdf, &unused);
+    if (!st.ok())
+      return st;
+  }
+  if (!have_kdf)
+    return absl::DataLossError("vault logs missing kdf header");
+
+  auto key = DeriveKey(passphrase, v.salt_.data(), v.kdf_);
+  if (!key.ok())
+    return key.status();
+  v.key_ = std::move(*key);
+
+  auto mutations = ReadMutations(dir, v.key_, &v.kdf_, &v.salt_);
+  if (!mutations.ok())
+    return mutations.status();
+  if (replay) {
+    auto replayed = Replay(std::move(*mutations));
+    if (!replayed.ok())
+      return replayed.status();
+    v.services_ = std::move(replayed->services);
+    v.history_ = std::move(replayed->history);
+  }
+  return v;
+}
 
 absl::Status Vault::Init(const std::string &dir,
                          const std::string &passphrase) {
   if (!EnsureDir(dir))
     return absl::InternalError("cannot create " + dir);
-  if (fs::exists(VaultFile(dir)))
-    return absl::AlreadyExistsError("vault already exists at " +
-                                    VaultFile(dir));
+  if (!VaultLogPaths(dir).empty())
+    return absl::AlreadyExistsError("vault already exists in " + dir);
 
   Vault v;
   v.dir_ = dir;
@@ -177,165 +601,104 @@ absl::Status Vault::Init(const std::string &dir,
   if (!key.ok())
     return key.status();
   v.key_ = std::move(*key);
-  return v.Save();
+  return AppendHeader(dir, v.kdf_, v.salt_);
 }
 
 absl::StatusOr<Vault> Vault::Open(const std::string &dir,
                                   const std::string &passphrase) {
-  auto raw = ReadFile(VaultFile(dir));
-  if (!raw.ok())
-    return raw.status();
-
-  json head = json::parse(*raw, nullptr, false);
-  if (head.is_discarded())
-    return absl::DataLossError("vault file is not valid JSON");
-
-  Vault v;
-  v.dir_ = dir;
-  const auto &kdf = head.at("kdf");
-  v.kdf_.nb_blocks = kdf.value("nb_blocks", 65536u);
-  v.kdf_.nb_passes = kdf.value("nb_passes", 3u);
-  v.kdf_.nb_lanes = kdf.value("nb_lanes", 1u);
-
-  auto salt = FromHex(kdf.at("salt").get<std::string>());
-  if (!salt.ok())
-    return salt.status();
-  if (salt->size() != kSaltBytes)
-    return absl::DataLossError("bad salt length");
-  std::copy(salt->begin(), salt->end(), v.salt_.begin());
-
-  auto key = DeriveKey(passphrase, v.salt_.data(), v.kdf_);
-  if (!key.ok())
-    return key.status();
-  v.key_ = std::move(*key);
-
-  auto blob = FromHex(head.at("body").get<std::string>());
-  if (!blob.ok())
-    return blob.status();
-  auto plain = AeadOpen(v.key_, blob->data(), blob->size());
-  if (!plain.ok())
-    return plain.status();
-
-  json body = json::parse(
-      std::string(reinterpret_cast<const char *>(plain->data()), plain->size()),
-      nullptr, false);
-  if (body.is_discarded())
-    return absl::DataLossError("decrypted vault body is not JSON");
-  if (body.value("schema_version", 0) != kBodySchemaVersion)
-    return absl::DataLossError(
-        "unsupported vault body schema; recreate the vault with this version");
-  if (!body.contains("services") || !body["services"].is_object())
-    return absl::DataLossError("vault body schema missing services object");
-
-  try {
-    for (auto &[name, j] : body.at("services").items()) {
-      Service s;
-      s.name = RequiredString(j, "name", name);
-      if (s.name != name)
-        return absl::DataLossError("service key/name mismatch for '" + name +
-                                   "'");
-      s.inject_env = RequiredString(j, "inject_env", name);
-      auto disc = ParseDisclosure(RequiredString(j, "disclosure", name));
-      if (!disc.ok())
-        return disc.status();
-      s.disclosure = *disc;
-      const auto &p = j.at("policy");
-      s.policy.max_ttl_seconds = RequiredU32(p, "max_ttl_seconds", name);
-      s.policy.max_uses = RequiredU32(p, "max_uses", name);
-      s.policy.description = RequiredString(p, "description", name);
-      s.policy.guidance = RequiredString(p, "guidance", name);
-      s.website_url = RequiredString(j, "website_url", name);
-      s.website_host = RequiredString(j, "website_host", name);
-      s.company = RequiredString(j, "company", name);
-      s.details = RequiredString(j, "details", name);
-      s.expires_at = j.value("expires_at", "");
-      s.created_at = RequiredString(j, "created_at", name);
-      s.updated_at = RequiredString(j, "updated_at", name);
-      if (!j.contains("update_timestamps") ||
-          !j["update_timestamps"].is_array())
-        return absl::DataLossError("service '" + name +
-                                   "' missing update_timestamps");
-      for (const auto &ts : j["update_timestamps"])
-        s.update_timestamps.push_back(ts.get<std::string>());
-      std::string cred = RequiredString(j, "credential", name);
-      s.credential.assign(cred);
-      SecureZero(cred.data(), cred.size());
-      auto valid = ValidateService(s);
-      if (!valid.ok())
-        return valid;
-      v.services_.emplace(name, std::move(s));
-    }
-  } catch (const std::exception &e) {
-    return absl::DataLossError(e.what());
-  }
-  return v;
+  return OpenInternal(dir, passphrase, true);
 }
 
-absl::Status Vault::Save() const {
-  std::string body = SerializeBody(services_);
-  auto blob = AeadSeal(
-      key_, reinterpret_cast<const std::uint8_t *>(body.data()), body.size());
-  SecureZero(body.data(), body.size());
-  if (!blob.ok())
-    return blob.status();
-
-  json head;
-  head["version"] = 1;
-  head["kdf"] = {{"salt", ToHex(salt_.data(), kSaltBytes)},
-                 {"nb_blocks", kdf_.nb_blocks},
-                 {"nb_passes", kdf_.nb_passes},
-                 {"nb_lanes", kdf_.nb_lanes}};
-  head["body"] = ToHex(blob->data(), blob->size());
-  return WriteFileAtomic(VaultFile(dir_), head.dump(2));
+absl::Status Vault::Verify(const std::string &dir,
+                           const std::string &passphrase) {
+  auto vault = OpenInternal(dir, passphrase, false);
+  return vault.ok() ? absl::OkStatus() : vault.status();
 }
 
 absl::Status Vault::AddService(Service service, SecureBuffer credential) {
   auto valid = ValidateService(service);
   if (!valid.ok())
     return valid;
+  if (services_.find(service.name) != services_.end())
+    return absl::AlreadyExistsError("service already exists '" + service.name +
+                                    "'");
   std::string now = NowIso8601();
+  service.credential.assign(credential.data(), credential.size());
+  Mutation m;
+  m.revision_id = RevisionId(MachineId(), now);
+  m.machine = MachineId();
+  m.ts = now;
+  m.action = "add";
+  m.service = service.name;
+  m.fields = ServiceFields(service);
+  m.credential = std::move(credential);
+  m.has_credential = true;
+  auto st = AppendMutation(dir_, key_, kdf_, salt_, std::move(m));
+  if (!st.ok())
+    return st;
   service.created_at = now;
   service.updated_at = now;
-  service.update_timestamps.clear();
-  service.update_timestamps.push_back(now);
-  service.credential = std::move(credential);
-  services_[service.name] = std::move(service);
-  return Save();
+  service.update_timestamps = {now};
+  services_.emplace(service.name, std::move(service));
+  return absl::OkStatus();
 }
 
-absl::Status Vault::EditService(const std::string &name, const Service &updates,
-                                const SecureBuffer *credential) {
+absl::Status Vault::EditService(const std::string &name,
+                                const Service &updates) {
   auto it = services_.find(name);
   if (it == services_.end())
     return absl::NotFoundError("unknown service '" + name + "'");
-  Service edited = CopyServiceMetadata(updates);
-  edited.name = name;
-  edited.created_at = it->second.created_at;
-  edited.update_timestamps = it->second.update_timestamps;
-  std::string now = NowIso8601();
-  edited.updated_at = now;
-  edited.update_timestamps.push_back(now);
-  if (credential) {
-    edited.credential.assign(reinterpret_cast<const char *>(credential->data()),
-                             credential->size());
-  } else {
-    edited.credential.assign(
-        reinterpret_cast<const char *>(it->second.credential.data()),
-        it->second.credential.size());
-  }
-  auto valid = ValidateService(edited);
+  auto valid = ValidateService(updates);
   if (!valid.ok())
     return valid;
-  it->second = std::move(edited);
-  return Save();
+  std::map<std::string, std::string> before = ServiceFields(it->second);
+  std::map<std::string, std::string> after = ServiceFields(updates);
+  std::map<std::string, std::string> changed;
+  for (const auto &[field, value] : after) {
+    if (before[field] != value)
+      changed[field] = value;
+  }
+  if (changed.empty())
+    return absl::OkStatus();
+
+  std::string now = NowIso8601();
+  Mutation m;
+  m.revision_id = RevisionId(MachineId(), now);
+  m.machine = MachineId();
+  m.ts = now;
+  m.action = "edit";
+  m.service = name;
+  m.fields = std::move(changed);
+  return AppendMutation(dir_, key_, kdf_, salt_, std::move(m));
+}
+
+absl::Status Vault::RotateService(const std::string &name,
+                                  SecureBuffer credential) {
+  if (services_.find(name) == services_.end())
+    return absl::NotFoundError("unknown service '" + name + "'");
+  std::string now = NowIso8601();
+  Mutation m;
+  m.revision_id = RevisionId(MachineId(), now);
+  m.machine = MachineId();
+  m.ts = now;
+  m.action = "rotate";
+  m.service = name;
+  m.credential = std::move(credential);
+  m.has_credential = true;
+  return AppendMutation(dir_, key_, kdf_, salt_, std::move(m));
 }
 
 absl::Status Vault::DeleteService(const std::string &name) {
-  auto it = services_.find(name);
-  if (it == services_.end())
+  if (services_.find(name) == services_.end())
     return absl::NotFoundError("unknown service '" + name + "'");
-  services_.erase(it);
-  return Save();
+  std::string now = NowIso8601();
+  Mutation m;
+  m.revision_id = RevisionId(MachineId(), now);
+  m.machine = MachineId();
+  m.ts = now;
+  m.action = "delete";
+  m.service = name;
+  return AppendMutation(dir_, key_, kdf_, salt_, std::move(m));
 }
 
 std::vector<std::string> Vault::ServiceNames() const {
@@ -349,6 +712,15 @@ std::vector<std::string> Vault::ServiceNames() const {
 const Service *Vault::Find(const std::string &name) const {
   auto it = services_.find(name);
   return it == services_.end() ? nullptr : &it->second;
+}
+
+std::vector<VaultHistoryEntry> Vault::History(const std::string &name) const {
+  std::vector<VaultHistoryEntry> out;
+  for (const auto &h : history_) {
+    if (h.service == name)
+      out.push_back(h);
+  }
+  return out;
 }
 
 } // namespace prout
