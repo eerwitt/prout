@@ -74,4 +74,5 @@ compile_commands.json
 
 # Demo VHS scripts
 demo.tape
+claude-demo.tape
 ttyd.bat

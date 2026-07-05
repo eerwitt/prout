@@ -2,6 +2,8 @@
 
 Prout is a local credential lease service for AI agents and automation. An agent states why it needs a specific credential, Prout uses Gemma 4 locally to understand why that credential is required and grant or deny. Prout provides temporary leases to execute commands with the credential or expose the raw credential in rare cases. All actions are kept in a append only log allowing conflict free sync'ing of the vault across machines.
 
+![Claude requesting a credential through Prout](docs/assets/claude-demo.gif)
+
 Credentials are stored in an encrypted vault. The daemon decrypts them into locked memory after unlock and serves local CLI requests over an AF_UNIX socket using length-prefixed JSON frames. Credentials may be disclosed only through active leases, in one of two policy modes:
 
 The model recommends; code enforces. Unknown services, malformed arbiter output, unknown verdicts, zero ceilings, bad disclosure modes, and requests exceeding policy ceilings are denied or rejected before credential release.
@@ -11,6 +13,8 @@ The model recommends; code enforces. Unknown services, malformed arbiter output,
 Often, I'm tempted to give agents my passwords, either by environment variable or pasting into a chat. I feel guilty each time. I want to provide Claude, Antigravity and Codex access to specific credentials and audit the "why?".
 
 Prout provides the layer on top of my vault to autonomously question agents on why they need access to a credential.
+
+![Prout daemon and CLI credential lease demo](docs/assets/prout-demo.gif)
 
 ## Warning
 
