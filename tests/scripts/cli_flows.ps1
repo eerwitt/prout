@@ -110,6 +110,15 @@ try {
   if ($r.Code -eq -999) { Fail 'second daemon hung instead of failing cleanly' }
   if ($r.Code -eq 0) { Fail 'second daemon unexpectedly bound live socket' }
 
+  $env:PROUT_CREDENTIAL = 'reload-secret'
+  $r = Invoke-Prout -ArgList @('vault', 'add', 'hf/reload', '--inject-env', 'HF_RELOAD_TOKEN', '--website', 'https://huggingface.co/', '--company', 'Hugging Face', '--details', 'daemon reload fixture token', '--disclosure', 'inject', '--max-ttl', '120', '--max-uses', '1', '--description', 'read-only Hugging Face fixture token')
+  if ($r.Code -ne 0) { Fail "vault add after daemon start failed: $($r.Err)" }
+  $env:PROUT_CREDENTIAL = ''
+  $r = Invoke-Prout -ArgList @('run', '--service', 'hf/reload', '--intent', 'check the Hugging Face profile with one read-only whoami request', '--', 'powershell', '-NoProfile', '-Command', "curl.exe -4 -H ('Authorization: Bearer ' + `$env:HF_RELOAD_TOKEN) 'https://huggingface.co/api/whoami-v2'")
+  if ($r.Code -ne 0) { Fail "daemon did not reload vault service added after startup: rc=$($r.Code) out=$($r.Out) err=$($r.Err)" }
+  $reloadGrant = $r.Out | ConvertFrom-Json
+  if ($reloadGrant.env_var -ne 'HF_RELOAD_TOKEN') { Fail "reload grant did not report injected env var: $($r.Out)" }
+
   $child = "if (`$env:API_TOKEN -ne 'inject-secret') { exit 3 }; Write-Output `$env:API_TOKEN; exit 0"
   $r = Invoke-Prout -ArgList @('run', '--service', 'github/personal', '--intent', 'update the local integration fixture with the configured token', '--', 'powershell', '-NoProfile', '-Command', $child)
   if ($r.Code -ne 0) { Fail "run negotiation failed: rc=$($r.Code) out=$($r.Out) err=$($r.Err)" }

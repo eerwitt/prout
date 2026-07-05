@@ -7,6 +7,7 @@
 #include <chrono>
 #include <csignal>
 #include <cstdio>
+#include <exception>
 #include <map>
 #include <memory>
 #include <sstream>
@@ -83,23 +84,30 @@ public:
         audit_(std::move(dir)) {}
 
   std::string Handle(const std::string &request) {
-    json req = json::parse(request, nullptr, false);
-    if (req.is_discarded())
-      return Error("malformed request");
-    std::string op = req.value("op", "");
-    if (op == "ping")
-      return json{{"status", "ok"}, {"model", arbiter_->using_model()}}.dump();
-    if (op == "negotiate")
-      return Negotiate(req);
-    if (op == "continue")
-      return Continue(req);
-    if (op == "execute")
-      return Execute(req);
-    if (op == "execute_result")
-      return ExecuteResult(req);
-    if (op == "expose_final")
-      return ExposeFinal(req);
-    return Error("unknown op '" + op + "'");
+    try {
+      json req = json::parse(request, nullptr, false);
+      if (req.is_discarded())
+        return Error("malformed request");
+      std::string op = req.value("op", "");
+      if (op == "ping")
+        return json{{"status", "ok"}, {"model", arbiter_->using_model()}}
+            .dump();
+      if (op == "negotiate")
+        return Negotiate(req);
+      if (op == "continue")
+        return Continue(req);
+      if (op == "execute")
+        return Execute(req);
+      if (op == "execute_result")
+        return ExecuteResult(req);
+      if (op == "expose_final")
+        return ExposeFinal(req);
+      return Error("unknown op '" + op + "'");
+    } catch (const std::exception &e) {
+      return Error("request failed: " + std::string(e.what()));
+    } catch (...) {
+      return Error("request failed");
+    }
   }
 
 private:
@@ -217,6 +225,24 @@ private:
   bool Expired(const Conversation &c) const {
     return std::chrono::steady_clock::now() >= c.expires_at;
   }
+
+  const Service *FindServiceFresh(const std::string &name, std::string *error) {
+    const Service *s = vault_.Find(name);
+    if (s)
+      return s;
+    auto st = vault_.Reload();
+    if (!st.ok()) {
+      *error = std::string(st.message());
+      return nullptr;
+    }
+    s = vault_.Find(name);
+    if (!s) {
+      *error = "unknown service '" + name + "'";
+      return nullptr;
+    }
+    return s;
+  }
+
   std::string DeliverCredential(const Conversation &c, const Service &s) {
     std::string credential(reinterpret_cast<const char *>(s.credential.data()),
                            s.credential.size());
@@ -243,9 +269,10 @@ private:
     c.expires_at = std::chrono::steady_clock::now() + std::chrono::minutes(10);
     if (c.kind != "run" && c.kind != "expose")
       return Error("invalid conversation kind");
-    const Service *s = vault_.Find(c.service);
+    std::string service_error;
+    const Service *s = FindServiceFresh(c.service, &service_error);
     if (!s)
-      return Error("unknown service '" + c.service + "'");
+      return Error(service_error);
     if (c.intent.empty())
       return Error("missing intent");
     if (c.kind == "run" && c.command.empty())
@@ -280,9 +307,10 @@ private:
     c.details = req.value("details", "");
     if (c.details.empty())
       return Error("missing details");
-    const Service *s = vault_.Find(c.service);
+    std::string service_error;
+    const Service *s = FindServiceFresh(c.service, &service_error);
     if (!s)
-      return Error("service vanished from vault");
+      return Error(service_error);
     Verdict v = arbiter_->Reply(c.arbiter_id, c.details);
     if (v.type == Verdict::Type::kQuestion)
       return Question(c, v.question);
@@ -316,12 +344,14 @@ private:
     if (!c.approved || c.kind != "run")
       return Deny(c, "lease is not approved for execute", "execute",
                   c.command_summary);
-    const Service *s = vault_.Find(c.service);
+    std::string service_error;
+    const Service *s = FindServiceFresh(c.service, &service_error);
     if (!s)
-      return Error("service vanished from vault");
+      return Error(service_error);
     std::uint32_t left = 0;
-    std::string service;
-    auto lease_status = leases_.Consume(lease_id, c.service, &left, &service);
+    std::string lease_service;
+    auto lease_status =
+        leases_.Consume(lease_id, c.service, &left, &lease_service);
     if (lease_status != LeaseTable::Status::kOk)
       return Deny(c, LeaseReason(lease_status), "execute", c.command_summary);
     c.lease_uses_remaining = left;
@@ -399,8 +429,9 @@ private:
     if (!c.approved || c.kind != "expose")
       return Deny(c, "lease is not approved for expose", "expose_final");
     std::uint32_t left = 0;
-    std::string service;
-    auto lease_status = leases_.Consume(lease_id, c.service, &left, &service);
+    std::string lease_service;
+    auto lease_status =
+        leases_.Consume(lease_id, c.service, &left, &lease_service);
     if (lease_status != LeaseTable::Status::kOk) {
       Conversation denied = c;
       lease_conversations_.erase(c.lease_id);
@@ -413,9 +444,10 @@ private:
       lease_conversations_.erase(c.lease_id);
       conversations_.erase(it);
     }
-    const Service *s = vault_.Find(delivered.service);
+    std::string service_error;
+    const Service *s = FindServiceFresh(delivered.service, &service_error);
     if (!s)
-      return Error("service vanished from vault");
+      return Error(service_error);
     if (s->disclosure != Disclosure::kReveal)
       return Deny(delivered, "service does not permit revealing its value",
                   "expose_final");

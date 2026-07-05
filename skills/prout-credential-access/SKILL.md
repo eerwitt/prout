@@ -13,7 +13,7 @@ Prefer the safer `run` plus `execute` flow for ordinary credential-backed comman
 
 First choose the Prout executable:
 
-1. If working inside the Prout repository and `.\dist\prout.exe` exists, use `.\dist\prout.exe`.
+1. If working inside the Prout repository and `prout` exists, use `prout`.
 2. Otherwise use `prout` from `PATH`.
 3. If no Prout executable is available, stop and report that Prout is unavailable.
 
@@ -26,23 +26,23 @@ Use this flow when a command can receive the credential through an injected chil
 Start by negotiating a run lease:
 
 ```powershell
-.\dist\prout.exe run --service <service> --intent "<specific purpose>" --agent <agent-name> -- <command...>
+prout run --service <service> --intent "<specific purpose>" --agent <agent-name> -- <command...>
 ```
 
-If using `prout` from `PATH`, replace `.\dist\prout.exe` with `prout`.
+If using `prout` from `PATH`, replace `prout` with `prout`.
 
 Inspect the JSON response:
 
 - If `status` is `"granted"`, treat `lease_id` as a bearer capability and execute exactly once with:
 
 ```powershell
-.\dist\prout.exe execute --lease <lease_id>
+prout execute --lease <lease_id>
 ```
 
 - If `status` is `"question"`, answer the returned `conversation_id` with specific details:
 
 ```powershell
-.\dist\prout.exe run --conversation <conversation_id> --details "<specific answer>" --agent <agent-name>
+prout run --conversation <conversation_id> --details "<specific answer>" --agent <agent-name>
 ```
 
 Then inspect the follow-up JSON response. Execute only after a `"granted"` response.
@@ -58,19 +58,19 @@ Use `expose` only when the task truly requires the raw credential value and an i
 Negotiate reveal-mode approval:
 
 ```powershell
-.\dist\prout.exe expose --service <service> --intent "<why the raw credential itself is required>" --agent <agent-name>
+prout expose --service <service> --intent "<why the raw credential itself is required>" --agent <agent-name>
 ```
 
 If the response has `status` `"question"`, answer with:
 
 ```powershell
-.\dist\prout.exe expose --conversation <conversation_id> --details "<specific answer>" --agent <agent-name>
+prout expose --conversation <conversation_id> --details "<specific answer>" --agent <agent-name>
 ```
 
 Only after a `"granted"` response, reveal the credential with:
 
 ```powershell
-.\dist\prout.exe expose --lease <lease_id>
+prout expose --lease <lease_id>
 ```
 
 After reveal, do not echo, log, summarize, persist, or include the exposed value in chat. Use it only for the authorized request.
@@ -82,7 +82,7 @@ Keep intents specific, bounded, and tied to the target service. Prefer read-only
 Write commands so the credential is consumed by the child process after Prout injects it. In PowerShell, escape child environment references with a backtick so the parent shell does not expand them before Prout runs the command:
 
 ```powershell
-.\dist\prout.exe run --service ml.huggingface --intent "validate the Hugging Face token with one read-only whoami request" --agent local -- powershell -NoProfile -Command "curl.exe -4 -H ('Authorization: Bearer ' + `$env:HF_TOKEN) 'https://huggingface.co/api/whoami-v2'"
+prout run --service ml.huggingface --intent "validate the Hugging Face token with one read-only whoami request" --agent local -- powershell -NoProfile -Command "curl.exe -4 -H ('Authorization: Bearer ' + `$env:HF_TOKEN) 'https://huggingface.co/api/whoami-v2'"
 ```
 
 Keep the child command on one line. Avoid commands that print environment variables, dump process state, enable verbose credential logging, or write the credential to disk.

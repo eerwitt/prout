@@ -71,3 +71,7 @@ third_party/litert-lm/bazel-*
 .vscode/
 .DS_Store
 compile_commands.json
+
+# Demo VHS scripts
+demo.tape
+ttyd.bat

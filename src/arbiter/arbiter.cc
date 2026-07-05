@@ -115,7 +115,9 @@ std::string BuildSystemPrompt(const Service &s) {
        "destructive work, abusive use, contradiction between intent and "
        "command, impossible use, or nonsense.\n"
        "- Credential exfiltration means printing, logging, saving, uploading, "
-       "or otherwise revealing the credential value or delivery env var.\n\n"
+       "or otherwise revealing the credential value. The delivery env var "
+       "name is metadata; referencing it to build an Authorization header for "
+       "the service host is normal use.\n\n"
        "Rationale rules:\n"
        "- Grant rationale: name the allowed use and lease size reason.\n"
        "- Question text: ask only for the missing fact needed to decide.\n"
@@ -153,8 +155,9 @@ std::string InitialUserText(const Service &s, const std::string &agent,
     o << "requested_command=" << command_summary << "\n\n";
   o << "Notes: requester_agent_name is only the caller label. "
        "credential_delivery_env_var is where Prout injects the credential if "
-       "a lease is granted. A command that prints or stores that variable "
-       "must be denied as credential exfiltration. Decide the lease only.";
+       "a lease is granted. The env var name itself is not secret. A command "
+       "that prints or stores the value read from that variable must be denied "
+       "as credential exfiltration. Decide the lease only.";
   return o.str();
 }
 
@@ -209,9 +212,9 @@ std::string ArbiterToolsJson() {
                         "unrelated to the service, or otherwise blocked. The "
                         "rationale must name the blocking rule and evidence, "
                         "not summarize the request. Printing or dumping the "
-                        "credential env var is credential exfiltration; using "
-                        "it in an Authorization header to the service host is "
-                        "not."},
+                        "credential env var value is credential exfiltration; "
+                        "using the configured env var in an Authorization "
+                        "header to the service host is not."},
         {"parameters", deny_params}}}};
   return json::array({grant, question, deny}).dump();
 }

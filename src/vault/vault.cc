@@ -201,11 +201,13 @@ std::vector<std::string> VaultLogPaths(const std::string &dir) {
   for (const auto &entry : fs::directory_iterator(dir, ec)) {
     if (ec)
       break;
-    if (!entry.is_regular_file())
-      continue;
     std::string name = entry.path().filename().string();
-    if (name.rfind("vault-", 0) == 0 && entry.path().extension() == ".jsonl")
+    if (name.rfind("vault-", 0) != 0 || entry.path().extension() != ".jsonl")
+      continue;
+    if (entry.is_regular_file(ec))
       paths.push_back(entry.path().string());
+    if (ec)
+      ec.clear();
   }
   std::sort(paths.begin(), paths.end());
   return paths;
@@ -608,6 +610,18 @@ absl::Status Vault::Verify(const std::string &dir,
                            const std::string &passphrase) {
   auto vault = OpenInternal(dir, passphrase, false);
   return vault.ok() ? absl::OkStatus() : vault.status();
+}
+
+absl::Status Vault::Reload() {
+  auto mutations = ReadMutations(dir_, key_, &kdf_, &salt_);
+  if (!mutations.ok())
+    return mutations.status();
+  auto replayed = Replay(std::move(*mutations));
+  if (!replayed.ok())
+    return replayed.status();
+  services_ = std::move(replayed->services);
+  history_ = std::move(replayed->history);
+  return absl::OkStatus();
 }
 
 absl::Status Vault::AddService(Service service, SecureBuffer credential) {

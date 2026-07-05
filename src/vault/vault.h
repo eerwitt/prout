@@ -69,6 +69,10 @@ public:
   static absl::Status Verify(const std::string &dir,
                              const std::string &passphrase);
 
+  // Replays current vault logs using the retained derived key. This lets the
+  // daemon observe append-only changes made by separate CLI vault commands.
+  absl::Status Reload();
+
   // Adds a service, then appends metadata, policy, and credential revisions.
   // `credential` is consumed.
   absl::Status AddService(Service service, SecureBuffer credential);
