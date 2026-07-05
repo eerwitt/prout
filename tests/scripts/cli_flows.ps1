@@ -119,6 +119,12 @@ try {
   $reloadGrant = $r.Out | ConvertFrom-Json
   if ($reloadGrant.env_var -ne 'HF_RELOAD_TOKEN') { Fail "reload grant did not report injected env var: $($r.Out)" }
 
+  $r = Invoke-Prout -ArgList @('run', '--service', 'hf/reload', '--intent', 'running an opaque python script', '--', 'python', './script.py')
+  if ($r.Code -ne 10) { Fail "opaque script request did not return question exit 10: rc=$($r.Code) out=$($r.Out) err=$($r.Err)" }
+  $opaqueQuestion = $r.Out | ConvertFrom-Json
+  if (-not $opaqueQuestion.conversation_id) { Fail "opaque script question did not include conversation id: $($r.Out)" }
+  if (-not $opaqueQuestion.question.Contains('script')) { Fail "opaque script question was not specific: $($r.Out)" }
+
   $child = "if (`$env:API_TOKEN -ne 'inject-secret') { exit 3 }; Write-Output `$env:API_TOKEN; exit 0"
   $r = Invoke-Prout -ArgList @('run', '--service', 'github/personal', '--intent', 'update the local integration fixture with the configured token', '--', 'powershell', '-NoProfile', '-Command', $child)
   if ($r.Code -ne 0) { Fail "run negotiation failed: rc=$($r.Code) out=$($r.Out) err=$($r.Err)" }

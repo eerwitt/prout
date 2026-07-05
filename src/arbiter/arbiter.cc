@@ -27,6 +27,51 @@ std::uint32_t Clamp(std::uint32_t v, std::uint32_t lo, std::uint32_t hi) {
   return v < lo ? lo : (v > hi ? hi : v);
 }
 
+std::string LowerAscii(const std::string &s) {
+  std::string o = s;
+  for (char &c : o)
+    c = static_cast<char>(std::tolower((unsigned char)c));
+  return o;
+}
+
+bool Contains(const std::string &hay, const char *needle) {
+  return hay.find(needle) != std::string::npos;
+}
+
+bool ContainsAny(const std::string &hay,
+                 const std::vector<const char *> &needles) {
+  for (const char *needle : needles) {
+    if (Contains(hay, needle))
+      return true;
+  }
+  return false;
+}
+
+std::string OpaqueExecutionQuestion(const std::string &intent,
+                                    const std::string &command_summary) {
+  std::string lower_intent = LowerAscii(intent);
+  bool opaque_intent = ContainsAny(
+      lower_intent,
+      {"opaque", "unknown", "unspecified", "arbitrary", "random", "some script",
+       "a script", "script.py", "python script", "local script"});
+  if (!opaque_intent)
+    return std::string();
+
+  std::string lower_command = LowerAscii(command_summary);
+  bool executes_local_code = ContainsAny(
+      lower_command,
+      {"python", "python3", "node", "ruby", "perl", "php", "pwsh", "powershell",
+       ".py", ".js", ".rb", ".ps1", ".sh", ".bat", ".cmd", ".exe"});
+  bool explains_action = ContainsAny(
+      lower_intent, {"read-only", "read only", "whoami", "profile", "account",
+                     "list", "check", "verify", "download", "upload", "create",
+                     "delete", "update", "rotate"});
+  if (!executes_local_code || explains_action)
+    return std::string();
+  return "What service API or account action will this script perform with "
+         "the credential, and is it read-only or state-changing?";
+}
+
 // Extracts the first balanced {...} JSON object embedded in `text`, ignoring
 // braces inside strings. Small models often wrap JSON in prose or fences.
 std::string FirstJsonObject(const std::string &text) {
@@ -107,9 +152,14 @@ std::string BuildSystemPrompt(const Service &s) {
        "- Grant read-only authenticated account/profile checks on the service "
        "host. Passing the credential as an Authorization header to that host "
        "is normal use, not exfiltration.\n"
+       "- Ask a question when the request asks to run an opaque, unknown, or "
+       "unspecified script/program and does not explain what credential-backed "
+       "action it will perform.\n"
        "- Inspect the whole requested_command, including actions after ';', "
        "'&&', pipes, redirects, subshells, and nested shell -Command strings.\n"
-       "- Ask a question only when one missing fact prevents a decision.\n"
+       "- Ask a question only when one missing fact prevents a decision. For "
+       "opaque local code, ask which service API/account action it will "
+       "perform and whether it is read-only or state-changing.\n"
        "- Deny only for a concrete blocker: "
        "unrelated host/service, credential exfiltration, unjustified "
        "destructive work, abusive use, contradiction between intent and "
@@ -485,6 +535,7 @@ public:
     std::string id = NewId();
     Neg n;
     n.policy = s.policy;
+    n.opaque_question = OpaqueExecutionQuestion(intent, command_summary);
     n.conv = CreateConversation(BuildSystemPrompt(s));
     if (!n.conv)
       return Verdict::Deny("arbiter failed to start a conversation");
@@ -504,6 +555,7 @@ public:
 private:
   struct Neg {
     Policy policy;
+    std::string opaque_question;
     int questions = 0;
     LiteRtLmConversation *conv = nullptr;
   };
@@ -570,6 +622,11 @@ private:
       }
     }
 
+    if (!n.opaque_question.empty() && n.questions == 0 &&
+        v.type != Verdict::Type::kQuestion) {
+      v = Verdict::Question(n.opaque_question);
+    }
+
     if (v.type == Verdict::Type::kQuestion && ++n.questions <= kMaxQuestions) {
       *nid = id;
       return v;
@@ -598,11 +655,15 @@ public:
                 std::string *nid) override {
     std::string t = Lower(intent);
     int words = CountWords(intent);
-    if (words < 4 && !asked_once_) {
-      asked_once_ = true;
+    std::string opaque_question =
+        OpaqueExecutionQuestion(intent, command_summary);
+    if (words < 4 || !opaque_question.empty()) {
       std::string id = NewId();
       pending_[id] = Pending{s.policy, s.website_host, command_summary};
       *nid = id;
+      if (words >= 4) {
+        return Verdict::Question(opaque_question);
+      }
       return Verdict::Question("What specifically will you do with this "
                                "credential, and for how long?");
     }
@@ -722,7 +783,6 @@ private:
                               " intent accepted (heuristic)");
   }
 
-  bool asked_once_ = false;
   struct Pending {
     Policy policy;
     std::string website_host;

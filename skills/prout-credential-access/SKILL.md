@@ -87,6 +87,13 @@ prout run --service ml.huggingface --intent "validate the Hugging Face token wit
 
 Keep the child command on one line. Avoid commands that print environment variables, dump process state, enable verbose credential logging, or write the credential to disk.
 
+Escaping depends on which tool issues the `prout run` command, because the outer shell parses the child PowerShell string before Prout ever sees it:
+
+- Bash tool (POSIX shell): a bare `$env:HF_TOKEN` or `$me` inside the double-quoted command is expanded by bash itself, not passed through literally. Escape every `$` intended for the child PowerShell process as `\$env:HF_TOKEN`, `\$me`, etc.
+- PowerShell tool: the command line is itself PowerShell, so a bare `$env:HF_TOKEN` is expanded by the outer PowerShell before Prout runs. Escape it with a backtick, e.g. `` `$env:HF_TOKEN ``, `` `$me ``, so the literal `$...` reaches the child process.
+
+Verify the stored command is correct before consuming the lease: `prout execute` runs exactly what was captured during `run` negotiation, so a bad escape only surfaces as a parse error at execute time and the lease is spent. If execute fails on a quoting error, negotiate a fresh lease with corrected escaping rather than retrying the same lease.
+
 ## Security Rules
 
 - Never place credentials in logs, chat responses, audit text, filenames, command summaries, error messages, or test artifacts.
