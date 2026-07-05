@@ -60,7 +60,8 @@ struct ServiceReplay {
   std::string add_key;
   std::string delete_key;
   std::map<std::string, FieldRevision> fields;
-  FieldRevision credential;
+  SecureBuffer credential;
+  std::string credential_sort_key;
   bool has_credential = false;
   std::vector<std::string> update_timestamps;
 };
@@ -182,7 +183,7 @@ absl::StatusOr<Service> BuildService(const ServiceReplay &r) {
     s.updated_at =
         r.update_timestamps.empty() ? s.created_at : r.update_timestamps.back();
     s.update_timestamps = r.update_timestamps;
-    s.credential.assign(r.credential.value);
+    s.credential.assign(r.credential.data(), r.credential.size());
     auto valid = ValidateService(s);
     if (!valid.ok())
       return valid;
@@ -470,15 +471,9 @@ void ApplyRevision(ServiceReplay *r, const Mutation &m) {
     }
   }
   if (m.has_credential &&
-      (!r->has_credential || key > r->credential.sort_key)) {
-    std::string cred(reinterpret_cast<const char *>(m.credential.data()),
-                     m.credential.size());
-    r->credential = FieldRevision{.value = cred,
-                                  .revision_id = m.revision_id,
-                                  .machine = m.machine,
-                                  .ts = m.ts,
-                                  .sort_key = key};
-    SecureZero(cred.data(), cred.size());
+      (!r->has_credential || key > r->credential_sort_key)) {
+    r->credential.assign(m.credential.data(), m.credential.size());
+    r->credential_sort_key = key;
     r->has_credential = true;
   }
   r->update_timestamps.push_back(m.ts);
@@ -498,7 +493,7 @@ bool MutationActive(const std::map<std::string, ServiceReplay> &states,
   if (m.action == "add")
     return key == r.add_key;
   if (m.action == "rotate")
-    return r.has_credential && key == r.credential.sort_key;
+    return r.has_credential && key == r.credential_sort_key;
   for (const auto &[field, _] : m.fields) {
     auto fit = r.fields.find(field);
     if (fit != r.fields.end() && fit->second.sort_key == key)

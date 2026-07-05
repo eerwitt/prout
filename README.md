@@ -11,7 +11,7 @@ The model recommends; code enforces. Unknown services, malformed arbiter output,
 
 ## Why?
 
-
+Regularly while using different agents, I saw myself tempted to just provide them some of my passwords either by environment variable or literally pasting into the chat. I feel guilty each time I think about it. I tried to use (Agent Vault)[https://github.com/Infisical/agent-vault] and it works well but I didn't like giving free access to all my credentials. I want to provide Claude, Antigravity and Codex access to specific credentials and audit the "why?" to look for problems in the requests. Gemma provides an easy way to locally question why an agent needs a credential and push back to allow agents to better justify needs.
 
 ## Current Commands
 
