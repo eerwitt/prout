@@ -47,25 +47,42 @@ bool ContainsAny(const std::string &hay,
   return false;
 }
 
+bool CommandLooksLikeOpaqueLocalCode(const std::string &lower_command) {
+  bool script_interpreter =
+      ContainsAny(lower_command,
+                  {"python", "python3", "node", "ruby", "perl", "php"}) &&
+      ContainsAny(lower_command, {".py", ".js", ".rb", ".pl", ".php"});
+  bool shell_script = ContainsAny(lower_command, {"pwsh", "powershell"}) &&
+                      ContainsAny(lower_command, {".ps1", "-file"});
+  bool batch_or_shell = ContainsAny(lower_command, {".sh", ".bat", ".cmd"});
+  return script_interpreter || shell_script || batch_or_shell;
+}
+
+bool ExplainsCredentialAction(const std::string &lower_text) {
+  return ContainsAny(lower_text,
+                     {"read-only", "read only", "whoami", "profile", "account",
+                      "list", "check", "verify", "download", "upload", "create",
+                      "delete", "update", "rotate", "request", "query", "fetch",
+                      "call", "inspect"});
+}
+
 std::string OpaqueExecutionQuestion(const std::string &intent,
                                     const std::string &command_summary) {
   std::string lower_intent = LowerAscii(intent);
+  std::string lower_command = LowerAscii(command_summary);
   bool opaque_intent = ContainsAny(
       lower_intent,
       {"opaque", "unknown", "unspecified", "arbitrary", "random", "some script",
        "a script", "script.py", "python script", "local script"});
-  if (!opaque_intent)
+  bool opaque_command = CommandLooksLikeOpaqueLocalCode(lower_command);
+  if (!opaque_intent && !opaque_command)
     return std::string();
 
-  std::string lower_command = LowerAscii(command_summary);
   bool executes_local_code = ContainsAny(
       lower_command,
       {"python", "python3", "node", "ruby", "perl", "php", "pwsh", "powershell",
        ".py", ".js", ".rb", ".ps1", ".sh", ".bat", ".cmd", ".exe"});
-  bool explains_action = ContainsAny(
-      lower_intent, {"read-only", "read only", "whoami", "profile", "account",
-                     "list", "check", "verify", "download", "upload", "create",
-                     "delete", "update", "rotate"});
+  bool explains_action = ExplainsCredentialAction(lower_intent);
   if (!executes_local_code || explains_action)
     return std::string();
   return "What service API or account action will this script perform with "
@@ -152,18 +169,28 @@ std::string BuildSystemPrompt(const Service &s) {
        "- Grant read-only authenticated account/profile checks on the service "
        "host. Passing the credential as an Authorization header to that host "
        "is normal use, not exfiltration.\n"
-       "- Ask a question when the request asks to run an opaque, unknown, or "
-       "unspecified script/program and does not explain what credential-backed "
-       "action it will perform.\n"
+       "- Treat requested_command as evidence, not just intent text. If it "
+       "runs local code such as python/node/ruby/perl/php scripts, shell "
+       "scripts, batch files, binaries, or nested shell commands whose "
+       "credential-backed action is not clear, ask a question.\n"
+       "- Vague intents such as doing what the requester wants with the "
+       "service, fixing things, running a script, or using the credential are "
+       "not concrete enough to grant unless the command itself clearly shows "
+       "the service API/account action and whether it is read-only or "
+       "state-changing.\n"
        "- Inspect the whole requested_command, including actions after ';', "
        "'&&', pipes, redirects, subshells, and nested shell -Command strings.\n"
        "- Ask a question only when one missing fact prevents a decision. For "
        "opaque local code, ask which service API/account action it will "
        "perform and whether it is read-only or state-changing.\n"
+       "- If the requester answers a question with another vague or generic "
+       "answer, deny because a clear credential-backed action was not "
+       "established.\n"
        "- Deny only for a concrete blocker: "
        "unrelated host/service, credential exfiltration, unjustified "
        "destructive work, abusive use, contradiction between intent and "
-       "command, impossible use, or nonsense.\n"
+       "command, impossible use, nonsense, or persistent vagueness after a "
+       "question.\n"
        "- Credential exfiltration means printing, logging, saving, uploading, "
        "or otherwise revealing the credential value. The delivery env var "
        "name is metadata; referencing it to build an Authorization header for "
@@ -251,20 +278,23 @@ std::string ArbiterToolsJson() {
        {{"name", "ask_question"},
         {"description",
          "Ask one concise follow-up question naming only the missing fact "
-         "needed to decide."},
+         "needed to decide. Ask when requested_command runs opaque local "
+         "code and the credential-backed service action is unclear."},
         {"parameters", question_params}}}};
   json deny = {
       {"type", "function"},
       {"function",
        {{"name", "deny_request"},
-        {"description", "Deny only when the requested credential use is "
-                        "unsafe, impossible, contradictory, nonsensical, "
-                        "unrelated to the service, or otherwise blocked. The "
-                        "rationale must name the blocking rule and evidence, "
-                        "not summarize the request. Printing or dumping the "
-                        "credential env var value is credential exfiltration; "
-                        "using the configured env var in an Authorization "
-                        "header to the service host is not."},
+        {"description",
+         "Deny only when the requested credential use is "
+         "unsafe, impossible, contradictory, nonsensical, "
+         "unrelated to the service, persistently vague after a question, "
+         "or otherwise blocked. The rationale must name the "
+         "blocking rule and evidence, "
+         "not summarize the request. Printing or dumping the "
+         "credential env var value is credential exfiltration; "
+         "using the configured env var in an Authorization "
+         "header to the service host is not."},
         {"parameters", deny_params}}}};
   return json::array({grant, question, deny}).dump();
 }
@@ -589,6 +619,15 @@ private:
   Verdict Advance(const std::string &id, const std::string &user_text,
                   std::string *nid) {
     Neg &n = negotiations_.at(id);
+    if (!n.opaque_question.empty() && n.questions > 0 &&
+        !ExplainsCredentialAction(LowerAscii(user_text))) {
+      if (n.conv)
+        litert_lm_conversation_delete(n.conv);
+      negotiations_.erase(id);
+      return Verdict::Deny(
+          "could not establish a clear credential-backed action after a "
+          "question");
+    }
     std::string msg = UserMessageJson(user_text);
     LiteRtLmJsonResponse *resp = litert_lm_conversation_send_message(
         n.conv, msg.c_str(), /*extra_context=*/nullptr,
@@ -659,7 +698,8 @@ public:
         OpaqueExecutionQuestion(intent, command_summary);
     if (words < 4 || !opaque_question.empty()) {
       std::string id = NewId();
-      pending_[id] = Pending{s.policy, s.website_host, command_summary};
+      pending_[id] = Pending{s.policy, s.website_host, command_summary,
+                             !opaque_question.empty()};
       *nid = id;
       if (words >= 4) {
         return Verdict::Question(opaque_question);
@@ -676,7 +716,14 @@ public:
       return Verdict::Deny("unknown or expired negotiation id");
     Pending pending = it->second;
     pending_.erase(it);
-    return Decide(pending.policy, pending.website_host, Lower(answer),
+    std::string lower_answer = Lower(answer);
+    if (pending.requires_clear_action &&
+        !ExplainsCredentialAction(lower_answer)) {
+      return Verdict::Deny(
+          "could not establish a clear credential-backed action after a "
+          "question (heuristic)");
+    }
+    return Decide(pending.policy, pending.website_host, lower_answer,
                   pending.command_summary);
   }
 
@@ -787,6 +834,7 @@ private:
     Policy policy;
     std::string website_host;
     std::string command_summary;
+    bool requires_clear_action = false;
   };
   std::map<std::string, Pending> pending_;
 };

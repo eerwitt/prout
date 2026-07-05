@@ -125,6 +125,13 @@ try {
   if (-not $opaqueQuestion.conversation_id) { Fail "opaque script question did not include conversation id: $($r.Out)" }
   if (-not $opaqueQuestion.question.Contains('script')) { Fail "opaque script question was not specific: $($r.Out)" }
 
+  $r = Invoke-Prout -ArgList @('run', '--service', 'hf/reload', '--intent', 'what I want with the ml.huggingface service', '--', 'python', 'runrequest.py')
+  if ($r.Code -ne 10) { Fail "opaque command with vague intent did not return question exit 10: rc=$($r.Code) out=$($r.Out) err=$($r.Err)" }
+  $commandOpaqueQuestion = $r.Out | ConvertFrom-Json
+  if (-not $commandOpaqueQuestion.conversation_id) { Fail "command-derived opaque question did not include conversation id: $($r.Out)" }
+  $r = Invoke-Prout -ArgList @('run', '--conversation', $commandOpaqueQuestion.conversation_id, '--details', 'just do what I want with the service')
+  if ($r.Code -ne 11) { Fail "vague answer after opaque command question was not denied: rc=$($r.Code) out=$($r.Out) err=$($r.Err)" }
+
   $child = "if (`$env:API_TOKEN -ne 'inject-secret') { exit 3 }; Write-Output `$env:API_TOKEN; exit 0"
   $r = Invoke-Prout -ArgList @('run', '--service', 'github/personal', '--intent', 'update the local integration fixture with the configured token', '--', 'powershell', '-NoProfile', '-Command', $child)
   if ($r.Code -ne 0) { Fail "run negotiation failed: rc=$($r.Code) out=$($r.Out) err=$($r.Err)" }
